@@ -21,8 +21,7 @@
 
 ## 演示视频
 
-<!-- 录制完成后请上传到 Bilibili / YouTube，将下行取消注释并填入链接 -->
-[![演示视频封面](demo/preview.gif)](https://www.bilibili.com/video/BV12TcZzoETh/)
+🎬 [点击观看演示视频](https://www.bilibili.com/video/BV12TcZzoETh/)
 
 > 📹 演示视频
 
