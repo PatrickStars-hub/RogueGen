@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'   # 当推送 v1.0.0 这样的 tag 时触发
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: 打包项目文件
+        run: |
+          ZIP_NAME="RogueGen-${{ github.ref_name }}.zip"
+          zip -r "$ZIP_NAME" . \
+            --exclude "*.git*" \
+            --exclude "*__pycache__*" \
+            --exclude "*.pyc" \
+            --exclude "backend/node_modules/*" \
+            --exclude "frontend/node_modules/*" \
+            --exclude "backend/roguelike.db" \
+            --exclude "backend/.env" \
+            --exclude "backend/static/art/*" \
+            --exclude "backend/static/games/*" \
+            --exclude "frontend/dist/*"
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: 创建 Release 并上传压缩包
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          body: |
+            ## 更新内容
+            - 请在此填写本次版本更新说明
+
+            ## 使用方法
+            1. 下载并解压 `RogueGen-${{ github.ref_name }}.zip`
+            2. 参考 README.md 完成环境配置
+            3. 运行 `./start.sh` 启动项目
+          draft: false
+          prerelease: false
+          files: ${{ env.ZIP_NAME }}
