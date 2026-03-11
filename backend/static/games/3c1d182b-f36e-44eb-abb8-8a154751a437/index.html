@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>星火余烬：荒厄之地</title>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.88.2/dist/phaser.min.js"></script>
+  <style>
+    html, body { margin:0; padding:0; background:#000; }
+    #game { width:1280px; height:720px; margin:0 auto; }
+  </style>
+</head>
+<body>
+<div id="game"></div>
+<script>
+const GAME_TITLE  = "星火余烬：荒厄之地";
+const THEME_COLOR = 0x6633cc;
+const PLAYER_HP   = 80;
+const MAX_ENERGY  = 3;
+const PLAYER_IMG  = 'char_protagonist';
+
+const CARDS = [
+  { id:'flame_spin', name:'烈焰回旋斩', effect:'flame_spin', value:20, times:3, desc:'造成3段20点火焰伤害。', color:0xe76f51 },
+  { id:'thunder_arrow', name:'雷霆贯穿箭', effect:'thunder_arrow', value:15, duration:2, desc:'造成15伤害并附加2回合感电。', color:0x00f5ff },
+  { id:'meteor_hammer', name:'星陨重锤', effect:'meteor_hammer', value:50, radius:100, desc:'造成50范围伤害并击退（眩晕1回合）。', color:0xff7b00 },
+  { id:'ember_shield', name:'余烬护盾', effect:'ember_shield', value:30, refreshTurns:4, desc:'获得30护盾，4回合后自动刷新；破碎反击。', color:0xe9c46a },
+  { id:'shadow_step', name:'影步瞬闪', effect:'shadow_step', duration:0.8, cooldownTurns:6, desc:'致命伤害时闪避并无敌，6回合冷却。', color:0x6a4c93 },
+  { id:'soul_siphon', name:'灵质虹吸', effect:'soul_siphon', radiusBoost:0.5, speedStep:5, speedCap:30, desc:'经验半径+50%，每50灵质速度+5%（上限30%）。', color:0x4cc9f0 },
+  { id:'alchemical_overload', name:'炼金超载', effect:'alchemical_overload', hpSacrifice:0.2, cdReduce:0.15, dmgBonus:0.1, desc:'失去20%生命，CD缩减15%，伤害+10%。', color:0xb5179e },
+  { id:'lantern_expand', name:'提灯扩容', effect:'lantern_expand', edgeBonus:0.2, visionBoost:0.4, desc:'视野扩大，边缘敌人承受额外20%伤害。', color:0xf4a261 },
+  { id:'time_stasis', name:'时光停滞符', effect:'time_stasis', killNeed:500, freezeTurns:1, critTurns:2, desc:'冻结敌人并进入高暴击状态。', color:0xadb5bd },
+  { id:'twin_spark', name:'双生火花', effect:'twin_spark', chance:0.15, enemyHpUp:0.1, desc:'15%概率额外获得一张卡，但敌人生命+10%。', color:0xffd700 }
+];
+
+const STARTER_DECK = [
+  'flame_spin','thunder_arrow','meteor_hammer','ember_shield','shadow_step',
+  'soul_siphon','alchemical_overload','lantern_expand','time_stasis','twin_spark'
+];
+
+const OPPONENTS = [
+  { name:'虚空爬行者', hp:90, atk:12, shield:0, color:0x4d194d, img:'enemy_crawler' },
+  { name:'蚀骨祭司', hp:220, atk:16, shield:0, color:0x6d2e8c, img:'enemy_priest' },
+  { name:'虚空吞噬者', hp:680, atk:26, shield:0, color:0x2b1035, img:'enemy_boss_devourer' }
+];
+
+function cardCostById(id){
+  const map = {
+    flame_spin:2, thunder_arrow:1, meteor_hammer:2, ember_shield:1, shadow_step:1,
+    soul_siphon:1, alchemical_overload:2, lantern_expand:1, time_stasis:2, twin_spark:1
+  };
+  return map[id] || 1;
+}
+
+/**
+ * 颜色抠图：采样图片四角和边缘中点识别背景色，
+ * 将与背景色相近的像素透明化，实现无缝融入深色场景。
+ */
+function removeBackground(scene, key, tolerance) {
+  tolerance = tolerance || 55;
+  if (!hasUsableTexture(scene, key)) return;
+  const src = scene.textures.get(key).source[0];
+  const w = src.width, h = src.height;
+  if (w < 4 || h < 4) return;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d');
+  try {
+    ctx.drawImage(src.image || src.canvas, 0, 0);
+    const imgData = ctx.getImageData(0, 0, w, h);
+    const d = imgData.data;
+
+    const sampleAt = (px, py) => {
+      const idx = (py * w + px) * 4;
+      return [d[idx], d[idx+1], d[idx+2], d[idx+3]];
+    };
+    // 采样 8 个边缘点，只取不透明的像素作为背景参考
+    const probes = [
+      sampleAt(0, 0), sampleAt(w-1, 0), sampleAt(0, h-1), sampleAt(w-1, h-1),
+      sampleAt(Math.floor(w/2), 0), sampleAt(0, Math.floor(h/2)),
+      sampleAt(w-1, Math.floor(h/2)), sampleAt(Math.floor(w/2), h-1)
+    ].filter(c => c[3] > 200);
+
+    if (probes.length === 0) return;
+
+    // 将相似颜色归组（同时处理棋盘格的两种灰）
+    const bgColors = [probes[0].slice(0, 3)];
+    for (const c of probes.slice(1)) {
+      const rgb = c.slice(0, 3);
+      const similar = bgColors.some(b =>
+        Math.abs(rgb[0]-b[0]) < 35 && Math.abs(rgb[1]-b[1]) < 35 && Math.abs(rgb[2]-b[2]) < 35
+      );
+      if (!similar) bgColors.push(rgb);
+    }
+
+    const tol2 = tolerance * tolerance;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i+3] < 10) continue;
+      for (const bg of bgColors) {
+        const dr = d[i]-bg[0], dg = d[i+1]-bg[1], db = d[i+2]-bg[2];
+        if (dr*dr + dg*dg + db*db < tol2) {
+          d[i+3] = 0;
+          break;
+        }
+      }
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+    scene.textures.remove(key);
+    scene.textures.addCanvas(key, cv);
+  } catch(e) {
+    console.warn('removeBackground failed for', key, e);
+  }
+}
+
+function hasUsableTexture(scene, key){
+  return scene.textures.exists(key)
+    && scene.textures.get(key)
+    && scene.textures.get(key).source
+    && scene.textures.get(key).source[0]
+    && scene.textures.get(key).source[0].width > 4;
+}
+
+function makeFallbackTexture(scene, key, color, w, h) {
+  if (hasUsableTexture(scene, key)) return;
+  const g = scene.make.graphics({ add: false });
+  g.fillStyle(color, 1).fillRoundedRect(0, 0, w, h, 14);
+  g.lineStyle(3, 0xffffff, 0.45).strokeRoundedRect(3, 3, w-6, h-6, 12);
+  const lc = Phaser.Display.Color.IntegerToColor(color).lighten(35).color;
+  g.fillStyle(lc, 1).fillCircle(w/2, h*0.28, w*0.2);
+  g.generateTexture(key, w, h);
+  g.destroy();
+}
+
+function makeHPBar(scene, x, y, w, h, maxHp, fillColor) {
+  scene.add.graphics().fillStyle(0x111111, 0.85).fillRect(x, y, w, h).setDepth(10);
+  const bar = scene.add.graphics().setDepth(11);
+  const txt = scene.add.text(x+w/2, y+h/2, '', {fontSize:'11px', color:'#fff'}).setOrigin(0.5).setDepth(12);
+  const refresh = (cur, max) => {
+    bar.clear();
+    const r = max > 0 ? Math.max(0, cur/max) : 0;
+    bar.fillStyle(r>0.5 ? fillColor : r>0.25 ? 0xffaa00 : 0xff3333, 1).fillRect(x, y, w*r, h);
+    txt.setText(`${Math.ceil(cur)}/${Math.ceil(max)}`);
+  };
+  refresh(maxHp, maxHp);
+  return { refresh };
+}
+
+function makeCard(scene, x, y, card) {
+  const W=145, H=217;
+  const c = scene.add.container(x, y).setDepth(8).setSize(W, H).setInteractive({useHandCursor:true});
+
+  const imgKey = `card_${card.id}`;
+  const hasImg = hasUsableTexture(scene, imgKey);
+
+  if (hasImg) {
+    const img = scene.add.image(0, 0, imgKey).setDisplaySize(W, H);
+    const hl = scene.add.graphics().lineStyle(3, 0xffd700, 0).strokeRoundedRect(-W/2,-H/2,W,H,6);
+    const costDot = scene.add.graphics().fillStyle(0x000000,0.78).fillCircle(-W/2+15,-H/2+15,14);
+    const costTxt = scene.add.text(-W/2+15,-H/2+15,`${card.cost||1}`,{fontSize:'15px',color:'#fff',fontStyle:'bold'}).setOrigin(0.5);
+    c.add([img, costDot, costTxt, hl]);
+    c.setData('hl', hl);
+  } else {
+    const bg = scene.add.graphics();
+    bg.fillStyle(0x0d0d22, 0.96).fillRoundedRect(-W/2,-H/2,W,H,8);
+    bg.lineStyle(2, card.color, 0.9).strokeRoundedRect(-W/2,-H/2,W,H,8);
+    const cg = scene.add.graphics().fillStyle(card.color,1).fillCircle(-W/2+13,-H/2+13,12);
+    const ct = scene.add.text(-W/2+13,-H/2+13,`${card.cost||1}`,{fontSize:'13px',color:'#fff',fontStyle:'bold'}).setOrigin(0.5);
+    const nt = scene.add.text(0,-H/2+28,card.name,{fontSize:'11px',color:'#fff',fontStyle:'bold',wordWrap:{width:W-12},align:'center'}).setOrigin(0.5);
+    const ic = scene.add.text(0,-H/2+86,'✦',{fontSize:'36px'}).setOrigin(0.5);
+    const sep = scene.add.graphics().lineStyle(1,card.color,0.35).lineBetween(-W/2+6,H/2-46,W/2-6,H/2-46);
+    const dt = scene.add.text(0,H/2-26,card.desc,{fontSize:'9px',color:'#ccc',wordWrap:{width:W-10},align:'center'}).setOrigin(0.5);
+    c.add([bg,cg,ct,nt,ic,sep,dt]);
+  }
+
+  return c;
+}
+
+function floatText(scene, x, y, msg, color) {
+  const t = scene.add.text(x, y, msg, {
+    fontSize:'28px', color:color||'#ff4444', fontStyle:'bold', stroke:'#000', strokeThickness:5
+  }).setOrigin(0.5).setDepth(22);
+  scene.tweens.add({targets:t, y:y-80, alpha:{from:1,to:0}, duration:900, onComplete:()=>t.destroy()});
+}
+
+class BootScene extends Phaser.Scene {
+  constructor(){super('Boot')}
+  preload(){
+    this.load.image('key_art_main', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/samples/key_art_main.jpg');
+    this.load.image('bg_main', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/samples/bg_main_scene.jpg');
+    this.load.image('bg_main_scene', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/samples/bg_main_scene.jpg');
+    this.load.image('bg_menu', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/bg_menu.jpg');
+    this.load.image(PLAYER_IMG, '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/samples/char_protagonist_sample.png');
+    this.load.image('---', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/---.png');
+
+    this.load.image('enemy_crawler', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/enemy_crawler.png');
+    this.load.image('enemy_priest', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/enemy_priest.png');
+    this.load.image('enemy_boss_devourer', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/enemy_boss_devourer.png');
+
+    this.load.image('card_flame_spin', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_flame_spin.jpg');
+    this.load.image('card_thunder_arrow', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_thunder_arrow.jpg');
+    this.load.image('card_meteor_hammer', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_meteor_hammer.jpg');
+    this.load.image('card_ember_shield', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_ember_shield.jpg');
+    this.load.image('card_shadow_step', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_shadow_step.jpg');
+    this.load.image('card_soul_siphon', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_soul_siphon.jpg');
+    this.load.image('card_alchemical_overload', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_alchemical_overload.jpg');
+    this.load.image('card_lantern_expand', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_lantern_expand.jpg');
+    this.load.image('card_time_stasis', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_time_stasis.jpg');
+    this.load.image('card_twin_spark', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/card_twin_spark.jpg');
+
+    this.load.image('ui_icon_exp', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/ui_icon_exp.png');
+    this.load.image('ui_frame_main', '/static/art/3c1d182b-f36e-44eb-abb8-8a154751a437/ui_frame_main.png');
+
+    const bar=this.add.graphics();
+    this.load.on('progress',v=>{
+      bar.clear().fillStyle(0x111111,0.9).fillRect(220,346,840,28);
+      bar.fillStyle(THEME_COLOR,1).fillRect(240,354,800*v,12);
+    });
+  }
+  create(){
+    makeFallbackTexture(this, 'player_fallback', 0xe76f51, 160, 160);
+    OPPONENTS.forEach(e=>makeFallbackTexture(this, `${e.img}_fallback`, e.color, 160, 160));
+
+    // ── 抠图：去除角色/敌人图片的白色或棋盘格背景 ────────────────
+    removeBackground(this, PLAYER_IMG, 55);
+    removeBackground(this, 'enemy_crawler', 50);
+    removeBackground(this, 'enemy_priest', 50);
+    removeBackground(this, 'enemy_boss_devourer', 50);
+
+    // ── 卡牌纹理：切换为 NEAREST 采样，消除双线性滤波糊化 ──────
+    CARDS.forEach(card => {
+      const key = `card_${card.id}`;
+      if (hasUsableTexture(this, key)) {
+        this.textures.get(key).setFilter(Phaser.Textures.FilterMode.NEAREST);
+      }
+    });
+
+    if(!hasUsableTexture(this, 'bg_main')){
+      const g=this.make.graphics({add:false});
+      g.fillGradientStyle(0x0a0a2a,0x0a0a2a,0x1a0a3a,0x1a0a3a,1);
+      g.fillRect(0,0,1280,720); g.generateTexture('bg_main',1280,720); g.destroy();
+    }
+    this.scene.start('Menu');
+  }
+}
+
+class MenuScene extends Phaser.Scene {
+  constructor(){super('Menu')}
+  create(){
+    this.add.image(640,360,hasUsableTexture(this,'bg_menu')?'bg_menu':'bg_main').setDisplaySize(1280,720).setDepth(0);
+    const ov=this.add.graphics().setDepth(1);
+    ov.fillGradientStyle(0,0,0,0,0.55,0.55,0,0).fillRect(0,0,1280,400);
+    ov.fillGradientStyle(0,0,0,0,0,0,0.7,0.7).fillRect(0,400,1280,320);
+
+    this.add.text(640,190,GAME_TITLE,{fontSize:'58px',color:'#ffd700',stroke:'#000',strokeThickness:9,fontStyle:'bold'}).setOrigin(0.5).setDepth(5);
+    this.add.text(640,265,'ROGUELIKE CARD PROTOTYPE',{fontSize:'16px',color:'#aaaaff',letterSpacing:3}).setOrigin(0.5).setDepth(5);
+
+    const btn=this.add.text(640,420,'  开始游戏  ',{fontSize:'34px',backgroundColor:'#6633cc',padding:{x:30,y:14},color:'#fff'})
+      .setOrigin(0.5).setInteractive({useHandCursor:true}).setDepth(5);
+    btn.on('pointerover',()=>btn.setAlpha(0.8));
+    btn.on('pointerout',()=>btn.setAlpha(1));
+    btn.on('pointerdown',()=>this.scene.start('Battle'));
+  }
+}
+
+class BattleScene extends Phaser.Scene {
+  constructor(){super('Battle')}
+
+  create(){
+    this.pl = {
+      hp:PLAYER_HP, maxHp:PLAYER_HP, shield:0, energy:MAX_ENERGY, maxEnergy:MAX_ENERGY,
+      dmgMul:1, cdReduce:0, edgeBonus:0, extraDraw:0, critTurns:0,
+      emberShieldActive:false, emberRefreshTimer:0, shadowReady:false, shadowCd:0,
+      soulRadiusBonus:0, soulOrbs:0, speedBonus:0, stasisKills:0
+    };
+
+    const oi = Phaser.Math.Between(0, OPPONENTS.length-1);
+    this.en = {...OPPONENTS[oi], maxHp:OPPONENTS[oi].hp, hp:OPPONENTS[oi].hp, shield:0, _stunned:false, _shocked:0, _night:false};
+
+    this.deck = Phaser.Utils.Array.Shuffle([...STARTER_DECK]);
+    this.hand=[]; this.discard=[]; this.cards=[]; this.busy=false; this.turn=1;
+
+    this.add.image(640,360,'bg_main').setDisplaySize(1280,720).setDepth(0);
+    this.add.graphics().fillStyle(0x000000,0.56).fillRect(0,505,1280,215).setDepth(2);
+
+    // 主角脚下光晕
+    this.add.graphics().setDepth(3)
+      .fillStyle(0x6633cc, 0.22).fillEllipse(210, 418, 160, 26);
+
+    const pReal=hasUsableTexture(this,PLAYER_IMG);
+    this.pSpr=this.add.image(210,330,pReal?PLAYER_IMG:'player_fallback')
+      .setDisplaySize(168,168).setDepth(4);
+
+    this.pHPBar=makeHPBar(this,20,475,220,18,PLAYER_HP,0x2299ff);
+    this.add.text(20,456,'HP',{fontSize:'12px',color:'#aaa'}).setDepth(10);
+    this.shTxt=this.add.text(20,496,'护盾: 0',{fontSize:'13px',color:'#88ccff'}).setDepth(10);
+    this.enTxt=this.add.text(20,516,'',{fontSize:'15px',color:'#ffdd44',fontStyle:'bold'}).setDepth(10);
+    this.buffTxt=this.add.text(20,538,'',{fontSize:'12px',color:'#cfd8ff',wordWrap:{width:360}}).setDepth(10);
+
+    // 敌人脚下光晕（颜色随敌人类型变化）
+    const enGlowColor = this.en.img === 'enemy_boss_devourer' ? 0x8811aa
+      : this.en.img === 'enemy_priest' ? 0x6622cc : 0x991155;
+    this.add.graphics().setDepth(3)
+      .fillStyle(enGlowColor, 0.25).fillEllipse(1000, 385, 160, 26);
+
+    const eReal=hasUsableTexture(this,this.en.img);
+    this.eSpr=this.add.image(1000,300,eReal?this.en.img:`${this.en.img}_fallback`)
+      .setDisplaySize(168,168).setDepth(4);
+
+    this.eHPBar=makeHPBar(this,870,140,210,18,this.en.hp,0x22bb44);
+    this.eNameTxt=this.add.text(870,120,this.en.name,{fontSize:'15px',color:'#ffdd44',fontStyle:'bold'}).setDepth(10);
+    this.intTxt=this.add.text(870,162,'',{fontSize:'12px',color:'#ffaaaa',wordWrap:{width:330}}).setDepth(10);
+
+    const eb=this.add.text(1185,520,'结束回合',{fontSize:'18px',backgroundColor:'#332211',padding:{x:14,y:8},color:'#ffdd88'})
+      .setOrigin(0.5).setInteractive({useHandCursor:true}).setDepth(10);
+    eb.on('pointerover',()=>eb.setAlpha(0.75));
+    eb.on('pointerout',()=>eb.setAlpha(1));
+    eb.on('pointerdown',()=>{ if(!this.busy) this.endTurn(); });
+
+    this.startPlayerTurn();
+  }
+
+  getCard(cid){ return CARDS.find(c=>c.id===cid)||CARDS[0]; }
+
+  drawCards(n){
+    let drawn = 0;
+    for(let i=0;i<n;i++){
+      if(!this.deck.length){
+        this.deck = Phaser.Utils.Array.Shuffle(this.discard.splice(0));
+      }
+      if(!this.deck.length) break;
+      this.hand.push(this.deck.pop());
+      drawn++;
+    }
+    if(drawn===0 && n>0){
+      floatText(this,640,420,'无牌可摸','#bbbbbb');
+    }
+  }
+
+  startPlayerTurn(){
+    this.pl.energy = this.pl.maxEnergy;
+    if(this.pl.shadowCd>0) this.pl.shadowCd--;
+
+    if(this.pl.emberShieldActive){
+      this.pl.emberRefreshTimer--;
+      if(this.pl.emberRefreshTimer<=0){
+        this.pl.shield = Math.max(this.pl.shield, 30);
+        this.pl.emberRefreshTimer = Math.max(1, Math.round(4*(1-this.pl.cdReduce)));
+        floatText(this,210,275,'余烬护盾刷新 +30','#ffd166');
+      }
+    }
+
+    const drawN = 5 + this.pl.extraDraw;
+    this.drawCards(Math.max(0, drawN - this.hand.length));
+
+    this.renderHand();
+    this.updateHUD();
+    this.updateIntent();
+  }
+
+  renderHand(){
+    this.cards.forEach(c=>c.destroy());
+    this.cards=[];
+    const n=this.hand.length, gap=150, sx=640-(Math.max(0,n-1))*gap/2;
+    this.hand.forEach((cid,i)=>{
+      const card=this.getCard(cid);
+      const x=sx+i*gap, y=618;
+      const obj=makeCard(this,x,y,{...card,cost:cardCostById(card.id)});
+      obj.on('pointerover',()=>{
+        obj.y=y-32; obj.setDepth(15);
+        const hl=obj.getData('hl'); if(hl) hl.setAlpha(1);
+      });
+      obj.on('pointerout',()=>{
+        obj.y=y; obj.setDepth(8);
+        const hl=obj.getData('hl'); if(hl) hl.setAlpha(0);
+      });
+      obj.on('pointerdown',()=>{ if(!this.busy) this.playCard(i); });
+      this.cards.push(obj);
+    });
+  }
+
+  updateIntent(){
+    if(this.en._stunned){ this.intTxt.setText('意图：被控制（跳过行动）'); return; }
+    if(this.en.img==='enemy_priest'){
+      this.intTxt.setText(this.turn%2===0 ? '意图：骨刺降临 30' : '意图：暗能射击 16');
+    } else if(this.en.img==='enemy_boss_devourer'){
+      this.intTxt.setText(this.en._night
+        ? (this.turn%2===0 ? '意图：永夜弹幕 35' : '意图：虚空撕咬 26')
+        : '意图：虚空撕咬 26');
+    } else {
+      this.intTxt.setText('意图：扑袭 12');
+    }
+  }
+
+  updateHUD(){
+    this.pHPBar.refresh(this.pl.hp, this.pl.maxHp);
+    this.eHPBar.refresh(this.en.hp, this.en.maxHp);
+    this.shTxt.setText(`护盾: ${Math.ceil(this.pl.shield)}`);
+    this.enTxt.setText(`能量: ${this.pl.energy}/${this.pl.maxEnergy} | 回合: ${this.turn}`);
+    const buffs = [];
+    if(this.pl.dmgMul>1) buffs.push(`伤害x${this.pl.dmgMul.toFixed(2)}`);
+    if(this.pl.critTurns>0) buffs.push(`暴击:${this.pl.critTurns}`);
+    if(this.pl.shadowReady) buffs.push(`影步:${this.pl.shadowCd<=0?'就绪':`CD${this.pl.shadowCd}`}`);
+    if(this.en._shocked>0) buffs.push(`敌感电:${this.en._shocked}`);
+    if(this.en.shield>0) buffs.push(`敌护盾:${this.en.shield}`);
+    this.buffTxt.setText(buffs.join(' | ') || '状态：无');
+  }
+
+  calcDamage(base){
+    let d = base * this.pl.dmgMul;
+    if(this.pl.edgeBonus>0){
+      const edge = (this.en.hp/this.en.maxHp<=0.6) || this.en._stunned;
+      if(edge) d *= (1+this.pl.edgeBonus);
+    }
+    if(this.pl.critTurns>0) d *= 2;
+    return Math.round(d);
+  }
+
+  damageEnemy(amount){
+    let d = Math.max(0, amount);
+    if(this.en.shield>0){
+      const absorb=Math.min(this.en.shield,d);
+      this.en.shield-=absorb;
+      d-=absorb;
+    }
+    this.en.hp=Math.max(0,this.en.hp-d);
+    this.pl.stasisKills += d;
+    if(this.pl.stasisKills>=500){
+      this.pl.stasisKills -= 500;
+      this.en._stunned = true;
+      this.pl.critTurns = Math.max(this.pl.critTurns,1);
+      floatText(this,1000,260,'时停触发！敌人冻结','#c2c2c2');
+    }
+    return d;
+  }
+
+  takePlayerDamage(amount){
+    let incoming = Math.max(0, amount);
+    const fatal = incoming >= (this.pl.hp + this.pl.shield);
+
+    if(fatal && this.pl.shadowReady && this.pl.shadowCd<=0){
+      this.pl.shadowCd = 6;
+      this.pl.shadowReady = false;
+      floatText(this,210,260,'影步触发：致命伤害闪避！','#b08dff');
+      return 0;
+    }
+
+    const prevShield = this.pl.shield;
+    if(this.pl.shield>0){
+      const absorb = Math.min(this.pl.shield, incoming);
+      this.pl.shield -= absorb;
+      incoming -= absorb;
+    }
+
+    if(prevShield>0 && this.pl.shield<=0 && this.pl.emberShieldActive){
+      const recoil = this.damageEnemy(12);
+      floatText(this,1000,250,`护盾破碎反击 -${recoil}`,'#ffd166');
+    }
+
+    if(incoming>0){
+      this.pl.hp = Math.max(0, this.pl.hp - incoming);
+      floatText(this,210,250,`-${incoming}`,'#ff6b6b');
+      this.tweens.add({targets:this.pSpr, x:{from:198,to:210}, duration:70, yoyo:true, repeat:2});
+    }
+
+    if(this.pl.hp<=0){
+      this.onLose();
+    }
+    return incoming;
+  }
+
+  playCard(idx){
+    const cid=this.hand[idx], card=this.getCard(cid), cost=cardCostById(cid);
+    if(this.pl.energy<cost){ floatText(this,640,400,'能量不足！','#ffaa00'); return; }
+
+    this.pl.energy-=cost;
+    this.hand.splice(idx,1);
+    this.discard.push(cid);
+
+    if(card.effect==='flame_spin'){
+      let total=0;
+      for(let k=0;k<card.times;k++) total += this.damageEnemy(this.calcDamage(card.value));
+      floatText(this,1000,260,`烈焰连斩 -${total}`,'#ff6b35');
+      this.tweens.add({targets:this.eSpr,angle:{from:-8,to:8},duration:60,yoyo:true,repeat:5});
+    } else if(card.effect==='thunder_arrow'){
+      const d=this.damageEnemy(this.calcDamage(card.value));
+      this.en._shocked = Math.max(this.en._shocked, card.duration);
+      floatText(this,1000,260,`雷贯 -${d} 感电`,'#00f5ff');
+      this.tweens.add({targets:this.eSpr,alpha:{from:0.4,to:1},duration:70,yoyo:true,repeat:4});
+    } else if(card.effect==='meteor_hammer'){
+      const d=this.damageEnemy(this.calcDamage(card.value));
+      this.en._stunned = true;
+      floatText(this,1000,260,`陨击 -${d} 击退`,'#ff7b00');
+      this.cameras.main.shake(180,0.006);
+    } else if(card.effect==='ember_shield'){
+      this.pl.emberShieldActive = true;
+      this.pl.emberRefreshTimer = Math.max(1, Math.round(card.refreshTurns*(1-this.pl.cdReduce)));
+      this.pl.shield += card.value;
+      floatText(this,210,280,`余烬护盾 +${card.value}`,'#ffd166');
+    } else if(card.effect==='shadow_step'){
+      this.pl.shadowReady = true;
+      if(this.pl.shadowCd<=0) floatText(this,210,280,'影步就绪（致命闪避）','#b08dff');
+      else floatText(this,210,280,`影步冷却:${this.pl.shadowCd}`,'#9a9a9a');
+    } else if(card.effect==='soul_siphon'){
+      this.pl.soulRadiusBonus = Math.max(this.pl.soulRadiusBonus, card.radiusBoost);
+      this.pl.soulOrbs += 50;
+      if(this.pl.soulOrbs>=50 && this.pl.speedBonus<card.speedCap){
+        this.pl.soulOrbs -= 50;
+        this.pl.speedBonus = Math.min(card.speedCap, this.pl.speedBonus + card.speedStep);
+        this.pl.maxEnergy = Math.min(6, this.pl.maxEnergy + 1);
+        floatText(this,210,280,`虹吸：速度+${card.speedStep}% 能量上限+1`,'#4cc9f0');
+      } else {
+        floatText(this,210,280,'虹吸激活：经验半径+50%','#4cc9f0');
+      }
+    } else if(card.effect==='alchemical_overload'){
+      const lose=Math.max(1,Math.floor(this.pl.maxHp*card.hpSacrifice));
+      this.pl.hp=Math.max(1,this.pl.hp-lose);
+      this.pl.dmgMul += card.dmgBonus;
+      this.pl.cdReduce = Math.min(0.5, this.pl.cdReduce + card.cdReduce);
+      floatText(this,210,280,`超载：-${lose}HP 伤害提升`,'#d946ef');
+    } else if(card.effect==='lantern_expand'){
+      this.pl.edgeBonus = Math.max(this.pl.edgeBonus, card.edgeBonus);
+      this.pl.extraDraw = Math.max(this.pl.extraDraw, 1);
+      floatText(this,640,400,'提灯扩容：边缘增伤+20%','#f4a261');
+    } else if(card.effect==='time_stasis'){
+      this.en._stunned = true;
+      this.pl.critTurns = Math.max(this.pl.critTurns, card.critTurns);
+      floatText(this,1000,260,'时光停滞：冻结+暴击','#d0d0d0');
+    } else if(card.effect==='twin_spark'){
+      const hpUp = Math.ceil(this.en.maxHp * card.enemyHpUp);
+      this.en.maxHp += hpUp;
+      this.en.hp += hpUp;
+      if(Math.random()<card.chance){
+        const pool = Phaser.Utils.Array.Shuffle([...STARTER_DECK]);
+        const extra = pool.find(x=>!this.hand.includes(x)) || pool[0];
+        this.hand.push(extra);
+        floatText(this,640,400,'双生共鸣：额外获得1张卡','#ffd700');
+      } else {
+        floatText(this,640,400,'双生代价：敌方生命提升','#ff9f1c');
+      }
+    }
+
+    if(this.pl.critTurns>0 && ['flame_spin','thunder_arrow','meteor_hammer'].includes(card.effect)) this.pl.critTurns--;
+    this.updateHUD();
+    this.renderHand();
+
+    if(this.en.hp<=0){ this.onWin(); return; }
+  }
+
+  endTurn(){
+    this.busy=true;
+    this.discard.push(...this.hand);
+    this.hand=[];
+    this.renderHand();
+
+    this.time.delayedCall(500,()=>this.enemyAct());
+  }
+
+  enemyAct(){
+    if(this.en._stunned){
+      this.en._stunned=false;
+      floatText(this,1000,260,'敌人被控制，跳过回合','#cc44ff');
+      this.nextTurn();
+      return;
+    }
+
+    if(this.en._shocked>0){
+      const shockD = this.damageEnemy(this.calcDamage(8));
+      this.en._shocked--;
+      floatText(this,1000,240,`感电 -${shockD}`,'#66e3ff');
+      if(this.en.hp<=0){ this.onWin(); return; }
+    }
+
+    if(this.en.img==='enemy_boss_devourer' && !this.en._night && this.en.hp/this.en.maxHp<=0.3){
+      this.en._night=true;
+      this.pl.maxEnergy=Math.max(2,this.pl.maxEnergy-1);
+      this.pl.energy=Math.min(this.pl.energy,this.pl.maxEnergy);
+      floatText(this,640,180,'永夜形态：提灯受压制！','#7a5cff');
+    }
+
+    let dmg = this.en.atk;
+    if(this.en.img==='enemy_priest' && this.turn%2===0) dmg = 30;
+    if(this.en.img==='enemy_boss_devourer' && this.en._night && this.turn%2===0) dmg = 35;
+    if(this.en._shocked>0) dmg = Math.max(1, Math.round(dmg*0.85));
+
+    floatText(this,210,220,`${this.en.name} 攻击！`,'#ffaaaa');
+    this.tweens.add({targets:this.eSpr, x:{from:1015,to:1000}, duration:85, yoyo:true, repeat:2});
+    this.takePlayerDamage(dmg);
+
+    if(this.pl.hp>0){
+      this.nextTurn();
+    }
+  }
+
+  nextTurn(){
+    this.turn++;
+    this.busy=false;
+    this.startPlayerTurn();
+  }
+
+  onWin(){
+    this.scene.start('Result', { win:true, turn:this.turn, enemy:this.en.name });
+  }
+
+  onLose(){
+    this.scene.start('Result', { win:false, turn:this.turn, enemy:this.en.name });
+  }
+}
+
+class ResultScene extends Phaser.Scene {
+  constructor(){ super('Result'); }
+  init(data){ this.dataPack = data || {}; }
+  create(){
+    this.add.image(640,360,'bg_main').setDisplaySize(1280,720);
+    this.add.graphics().fillStyle(0x000000,0.66).fillRect(0,0,1280,720);
+
+    const win = !!this.dataPack.win;
+    this.add.text(640,250, win ? '战斗胜利' : '战斗失败', {
+      fontSize:'64px', color:win?'#ffd700':'#ff5d73', fontStyle:'bold', stroke:'#000', strokeThickness:8
+    }).setOrigin(0.5).setDepth(10);
+
+    this.add.text(640,330, `对手：${this.dataPack.enemy || '未知'}  |  回合：${this.dataPack.turn || 0}`, {
+      fontSize:'24px', color:'#e0e0ff'
+    }).setOrigin(0.5).setDepth(10);
+
+    const btn1 = this.add.text(640,430,'  再来一局  ',{
+      fontSize:'34px', backgroundColor:'#3a255f', color:'#fff', padding:{x:26,y:12}
+    }).setOrigin(0.5).setInteractive({useHandCursor:true}).setDepth(10);
+
+    const btn2 = this.add.text(640,500,'  返回菜单  ',{
+      fontSize:'28px', backgroundColor:'#333', color:'#fff', padding:{x:20,y:10}
+    }).setOrigin(0.5).setInteractive({useHandCursor:true}).setDepth(10);
+
+    btn1.on('pointerdown',()=>this.scene.start('Battle'));
+    btn2.on('pointerdown',()=>this.scene.start('Menu'));
+  }
+}
+
+new Phaser.Game({
+  type: Phaser.AUTO,
+  parent: 'game',
+  width: 1280,
+  height: 720,
+  backgroundColor: '#000000',
+  scene: [BootScene, MenuScene, BattleScene, ResultScene]
+});
+</script>
+</body>
+</html>

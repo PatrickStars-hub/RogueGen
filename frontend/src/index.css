@@ -1,0 +1,240 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── 全局 CSS 变量 ───────────────────────────────────────────── */
+:root {
+  --bg-void:      #050510;
+  --bg-panel:     #0D0D1A;
+  --neon-purple:  #8B5CF6;
+  --neon-cyan:    #06B6D4;
+  --neon-green:   #10B981;
+  --neon-pink:    #EC4899;
+}
+
+/* ── 基础重置 ────────────────────────────────────────────────── */
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg-void);
+  color: #E2E8F0;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── 背景色工具类 ────────────────────────────────────────────── */
+.bg-void { background: var(--bg-void); }
+
+/* ── 扫描线特效 ──────────────────────────────────────────────── */
+.scanlines {
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.08) 2px,
+    rgba(0, 0, 0, 0.08) 4px
+  );
+  pointer-events: none;
+}
+
+/* ── Glitch 文字特效 ─────────────────────────────────────────── */
+.glitch-text {
+  position: relative;
+  display: inline-block;
+}
+.glitch-text.glitching::before,
+.glitch-text.glitching::after {
+  content: attr(data-glitch);
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  opacity: 0.8;
+}
+.glitch-text.glitching::before {
+  color: var(--neon-cyan);
+  clip-path: polygon(0 30%, 100% 30%, 100% 50%, 0 50%);
+  transform: translateX(-3px);
+  animation: glitch-shift 0.15s steps(2) forwards;
+}
+.glitch-text.glitching::after {
+  color: var(--neon-pink);
+  clip-path: polygon(0 55%, 100% 55%, 100% 75%, 0 75%);
+  transform: translateX(3px);
+  animation: glitch-shift 0.1s steps(2) reverse forwards;
+}
+@keyframes glitch-shift {
+  0%   { transform: translateX(-3px) skewX(-2deg); }
+  50%  { transform: translateX(3px)  skewX(2deg); }
+  100% { transform: translateX(0)    skewX(0); }
+}
+
+/* ── 游戏文档 Markdown 样式 ──────────────────────────────────── */
+.game-doc {
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  font-size: 13.5px;
+  line-height: 1.8;
+  color: #b8c4d4;
+}
+
+/* 一级标题：游戏名称，带渐变光效 */
+.game-doc h1 {
+  font-size: 1.5rem;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  background: linear-gradient(135deg, #a78bfa 0%, #22d3ee 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  border-bottom: 1px solid rgba(139,92,246,0.25);
+  padding-bottom: 0.6rem;
+  margin-bottom: 1.2rem;
+  margin-top: 0.5rem;
+}
+
+/* 二级标题：章节，带左侧色条 */
+.game-doc h2 {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #e2e8f0;
+  margin-top: 1.8rem;
+  margin-bottom: 0.7rem;
+  padding: 0.4rem 0.9rem;
+  background: rgba(34,211,238,0.06);
+  border-left: 3px solid var(--neon-cyan);
+  border-radius: 0 6px 6px 0;
+}
+
+/* 三级标题 */
+.game-doc h3 {
+  font-size: 0.93rem;
+  font-weight: 600;
+  color: #94a3b8;
+  margin-top: 1.2rem;
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.game-doc h3::before {
+  content: '▸';
+  color: var(--neon-purple);
+  font-size: 0.8em;
+}
+
+/* 四级标题 */
+.game-doc h4 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--neon-pink);
+  margin-top: 0.9rem;
+  margin-bottom: 0.3rem;
+}
+
+/* 段落 */
+.game-doc p {
+  margin-bottom: 0.7rem;
+  color: #94a3b8;
+}
+
+/* 加粗 */
+.game-doc strong {
+  color: #e2e8f0;
+  font-weight: 700;
+}
+
+/* 行内代码 */
+.game-doc code {
+  background: rgba(139,92,246,0.15);
+  color: var(--neon-cyan);
+  padding: 0.15em 0.45em;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.83em;
+  border: 1px solid rgba(139,92,246,0.2);
+}
+
+/* 代码块 */
+.game-doc pre {
+  background: #0d0f1a;
+  border: 1px solid rgba(139,92,246,0.2);
+  border-radius: 8px;
+  padding: 1rem 1.2rem;
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+.game-doc pre code {
+  background: none;
+  color: #7dd3fc;
+  padding: 0;
+  border: none;
+  font-size: 0.82em;
+  line-height: 1.6;
+}
+
+/* 表格 */
+.game-doc table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.82rem;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.game-doc th {
+  background: rgba(139,92,246,0.18);
+  color: #c4b5fd;
+  padding: 0.5rem 0.8rem;
+  border: 1px solid rgba(139,92,246,0.25);
+  font-weight: 600;
+  text-align: left;
+  font-size: 0.8rem;
+  letter-spacing: 0.03em;
+}
+.game-doc td {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid rgba(255,255,255,0.05);
+  color: #7c8fa8;
+}
+.game-doc tr:hover td {
+  background: rgba(139,92,246,0.06);
+  color: #94a3b8;
+}
+.game-doc tr:nth-child(even) td {
+  background: rgba(255,255,255,0.02);
+}
+
+/* 列表 */
+.game-doc ul, .game-doc ol {
+  padding-left: 1.5rem;
+  margin-bottom: 0.7rem;
+}
+.game-doc li {
+  margin-bottom: 0.3rem;
+  color: #7c8fa8;
+}
+.game-doc li::marker { color: var(--neon-purple); }
+.game-doc ul > li { list-style-type: disc; }
+
+/* 引用块 */
+.game-doc blockquote {
+  border-left: 3px solid rgba(139,92,246,0.5);
+  padding: 0.6rem 1rem;
+  color: #64748b;
+  margin: 1rem 0;
+  font-style: italic;
+  background: rgba(139,92,246,0.04);
+  border-radius: 0 6px 6px 0;
+}
+
+/* 分割线 */
+.game-doc hr {
+  border: none;
+  border-top: 1px solid rgba(139,92,246,0.15);
+  margin: 1.5rem 0;
+}
+
+/* ── 滚动条样式 ──────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(139,92,246,0.3); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(139,92,246,0.5); }
