@@ -1,0 +1,25 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: roguegen-backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend/static:/app/static       # 持久化 AI 生成的图片和游戏文件
+      - ./backend/roguelike.db:/app/roguelike.db  # 持久化数据库
+    ports:
+      - "8765:8765"                         # 可选：直接暴露后端端口（调试用）
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: roguegen-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
