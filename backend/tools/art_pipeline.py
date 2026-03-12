@@ -293,17 +293,39 @@ async def run_art_pipeline(
             local_path: str
 
             if task.force_gemini:
-                # ── 强制 Gemini ───────────────────────────────────
-                gemini_imgs = await gemini.generate(prompt, image_size="2K")
-                if not gemini_imgs:
-                    raise RuntimeError("Gemini 未返回图片数据")
-                img = gemini_imgs[0]
-                if img.b64_data:
-                    local_path = process_image(img.b64_data, spec, session_id, task.filename)
-                elif img.url:
-                    local_path = await download_and_process(img.url, spec, session_id, task.filename)
+                # ── 强制 Gemini，失败时切回豆包 ───────────────────
+                gemini_exc: Exception | None = None
+                gemini_imgs = []
+                try:
+                    gemini_imgs = await gemini.generate(prompt, image_size="2K")
+                except Exception as e:
+                    gemini_exc = e
+                    logger.warning("Gemini 失败，切回 Doubao：task=%s err=%s", task.filename, e)
+
+                if gemini_exc or not gemini_imgs:
+                    yield {
+                        "type": "warning",
+                        "task": task.filename,
+                        "message": f"Gemini 失败（{gemini_exc}），已切换至豆包",
+                    }
+                    images = await doubao.generate(prompt, size=_spec_to_doubao_size(spec))
+                    if not images:
+                        raise RuntimeError(f"Gemini 和 Doubao 均未返回图片（Gemini: {gemini_exc}）")
+                    img = images[0]
+                    if img.url:
+                        local_path = await download_and_process(img.url, spec, session_id, task.filename)
+                    elif img.b64_data:
+                        local_path = process_image(img.b64_data, spec, session_id, task.filename)
+                    else:
+                        raise RuntimeError("Doubao 未返回有效图片数据")
                 else:
-                    raise RuntimeError("Gemini 未返回有效图片数据")
+                    img = gemini_imgs[0]
+                    if img.b64_data:
+                        local_path = process_image(img.b64_data, spec, session_id, task.filename)
+                    elif img.url:
+                        local_path = await download_and_process(img.url, spec, session_id, task.filename)
+                    else:
+                        raise RuntimeError("Gemini 未返回有效图片数据")
             else:
                 # ── Doubao 优先，失败自动降级 Gemini ─────────────
                 import time as _time
