@@ -1,6 +1,7 @@
 """
 会话管理 API：创建、查询、恢复、回滚、导出。
 """
+import asyncio
 import json
 import logging
 import uuid
@@ -157,22 +158,19 @@ async def stream_session(session_id: str, user_requirement: str = ""):
         "art_style_notes": None,
     }
 
-    async def event_generator():
-        # 推送开始信号
+    async def _raw_event_generator():
         yield _sse("status", {"message": "开始分析需求...", "stage": "start"})
 
         async for event in graph.astream_events(initial_state, config, version="v2"):
             event_name = event.get("name", "")
             event_type = event.get("event", "")
 
-            # Agent 节点开始
             if event_type == "on_chain_start" and event_name in (
                 "requirement_analyst", "gameplay_designer", "worldview_builder",
                 "art_director", "tech_architect", "doc_integrator",
             ):
                 yield _sse("agent_status", {"agent": event_name, "status": "running"})
 
-            # Agent 节点完成
             elif event_type == "on_chain_end" and event_name in (
                 "requirement_analyst", "gameplay_designer", "worldview_builder",
                 "art_director", "tech_architect", "doc_integrator",
@@ -180,7 +178,6 @@ async def stream_session(session_id: str, user_requirement: str = ""):
                 output = event.get("data", {}).get("output", {})
                 yield _sse("agent_status", {"agent": event_name, "status": "done"})
 
-                # 推送各模块文档
                 section_map = {
                     "gameplay_designer": ("gameplay", "sec_gameplay"),
                     "worldview_builder": ("worldview", "sec_worldview"),
@@ -198,13 +195,11 @@ async def stream_session(session_id: str, user_requirement: str = ""):
                             "versions": output.get("versions", {}),
                         })
 
-            # LLM Token 流式输出
             elif event_type == "on_chat_model_stream":
                 chunk = event.get("data", {}).get("chunk")
                 if chunk and hasattr(chunk, "content") and chunk.content:
                     yield _sse("token", {"text": chunk.content})
 
-        # 运行完毕，等待用户审阅
         state = await graph.aget_state(config)
         sv = state.values
         title = _derive_title(user_requirement, sv.get("structured_req"))
@@ -225,11 +220,29 @@ async def stream_session(session_id: str, user_requirement: str = ""):
         })
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        _with_heartbeat(_raw_event_generator()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── 获取当前会话状态 ───────────────────────────────────────────
-def _compute_pipeline_step(sv: dict) -> int:
+def _scan_art_dir(session_id: str) -> dict[str, str]:
+    """扫描磁盘上已生成的美术文件，返回 {filename_no_ext: url_path}。"""
+    import os
+    art_dir = os.path.join(os.path.dirname(__file__), "..", "static", "art", session_id)
+    if not os.path.isdir(art_dir):
+        return {}
+    result: dict[str, str] = {}
+    for fname in os.listdir(art_dir):
+        stem, ext = os.path.splitext(fname)
+        if ext.lower() in (".jpg", ".jpeg", ".png", ".webp") and stem:
+            result[stem] = f"/static/art/{session_id}/{fname}"
+    return result
+
+
+def _compute_pipeline_step(sv: dict, session_id: str = "") -> int:
     """根据 LangGraph 状态值推算当前应恢复到哪个 pipelineStep。
     步骤对应：0=需求, 1=生成中, 2=确认, 3=美术风格, 4=游戏生成, 5=代码检查, 6=就绪
     """
@@ -241,9 +254,13 @@ def _compute_pipeline_step(sv: dict) -> int:
     art_assets = sv.get("art_assets")
     art_phase   = sv.get("art_phase", 0)
     if art_assets or art_phase >= 3:
-        return 4          # 美术全套已完成，等待/已完成代码生成
+        return 4          # 美术全套已完成（art_phase=3），等待/已完成代码生成
+    if art_phase >= 2:
+        # 风格已确认（art_phase=2）但全套未完成（含中途断开续传）
+        # → 直接进步骤4，BuildDashboard 会用磁盘文件续传，不重复花钱
+        return 4
     if art_phase >= 1:
-        return 3          # 美术样本阶段（生成中或已确认）
+        return 3          # 美术样本阶段（生成中或已生成待确认）
     if sv.get("final_doc") or sv.get("sec_gameplay"):
         return 2          # GDD 已生成，等待确认
     return 0
@@ -285,8 +302,29 @@ async def get_session(session_id: str):
         }
 
     sv = state.values
-    art_assets  = sv.get("art_assets") or {}
-    art_samples = sv.get("art_samples") or {}
+    art_phase_val = sv.get("art_phase", 0)
+    art_assets_state = sv.get("art_assets") or {}
+    art_samples      = sv.get("art_samples") or {}
+
+    # art_full_done：美术全套是否真正完成（generate_art complete 事件触发后 art_phase=3）
+    # 用此字段区分"真正完成"（不需要重跑）和"磁盘有文件但中途中断"（需要续传剩余任务）
+    art_full_done = art_phase_val >= 3 or bool(art_assets_state)
+
+    # art_assets 返回给前端用于显示：
+    # - 真正完成 → 用 state 里的数据
+    # - 中途中断 → 用磁盘扫描（让前端可以预览已生成的图片，但不视为"完成"）
+    if art_full_done:
+        art_assets = art_assets_state
+    else:
+        # 磁盘扫描：有文件就返回给前端展示，但 art_full_done=False 告知前端仍需续传
+        disk_full = {k: v for k, v in _scan_art_dir(session_id).items()
+                     if not k.startswith("samples")}
+        if disk_full and art_phase_val >= 2:
+            logger.info(
+                "get_session：磁盘有 %d 个部分文件，art_full_done=False，待续传（session=%s）",
+                len(disk_full), session_id,
+            )
+        art_assets = disk_full if (disk_full and art_phase_val >= 2) else art_assets_state
 
     return {
         "session_id":    session_id,
@@ -300,7 +338,8 @@ async def get_session(session_id: str):
         "sec_tech":      sv.get("sec_tech", ""),
         "confirmed":     sv.get("confirmed", False),
         "iteration_count": sv.get("iteration_count", 0),
-        "art_phase":     sv.get("art_phase", 0),
+        "art_phase":     art_phase_val,
+        "art_full_done": art_full_done,   # 新增：前端用此决定是否标记 artGenDone=true
         "art_samples":   art_samples,
         "art_assets":    art_assets,
         # game_code 可能很大，只返回是否存在 + 前128字符供验证
@@ -421,7 +460,11 @@ async def resume_session(session_id: str, feedback: str = ""):
             })
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        _with_heartbeat(event_generator()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── 版本历史 ───────────────────────────────────────────────────
@@ -509,6 +552,7 @@ async def generate_art_samples(session_id: str):
 
     sv = state_snapshot.values
     sr = sv.get("structured_req") or {}
+    logger.info(f"structured_req: {sr}")
     style       = sr.get("visual_style", "pixel art")
     theme       = sr.get("theme", "dark fantasy roguelike")
     protagonist = sr.get("protagonist", "hero")
@@ -529,15 +573,17 @@ async def generate_art_samples(session_id: str):
         if color_match:
             color_hint = f"Color palette: {color_match.group(1).strip()[:100]}. "
 
-    # 从 GDD 提取游戏名称
+    # 游戏名称：优先从 final_doc 提取，否则与 doc_integrator 一致用 theme+protagonist 推导
     game_title = ""
     if sv.get("final_doc"):
         import re as _re2
-        title_match = _re2.search(r'游戏名称[：:]\s*(.+)', sv.get("final_doc", ""))
-        if title_match:
-            game_title = title_match.group(1).strip()[:30]
+        for pat in (r'游戏名称[：:]\s*([^\n]+)', r'游戏名称[：:]\s*\*?\*?([^\n*]+)'):
+            m = _re2.search(pat, sv.get("final_doc", ""))
+            if m:
+                game_title = m.group(1).strip()[:30]
+                break
     if not game_title:
-        game_title = theme
+        game_title = f"{theme}{protagonist}肉鸽" if (theme and protagonist) else (theme or protagonist or "肉鸽游戏")
 
     style_prefix = (
         f"Art style: {style}. Theme: {theme}. Protagonist: {protagonist}. "
@@ -552,9 +598,11 @@ async def generate_art_samples(session_id: str):
             prompt=(
                 f"{style_prefix}"
                 f"游戏世界观概念图，史诗感全景构图，展示游戏世界的宏大场景与氛围，"
-                f"光效戏剧性，色彩丰富，深度感强，专业概念艺术品质，16:9比例，"
-                f"画面中央或顶部显示游戏标题文字「{game_title}」，字体华丽与世界观风格匹配，"
-                f"无UI按钮，无角色立绘，纯场景氛围展示，高细节，精美背景艺术。"
+                f"光效氛围浓郁，色彩丰富，深度感强，专业概念艺术品质，16:9 比例，"
+                f"画面中央或顶部清晰显示游戏标题文字「{game_title}」，"
+                f"中文标题字体华丽、装饰感强，并且与世界观风格匹配，"
+                f"画面中不出现任何 UI 按钮，不出现角色立绘，只有环境与建筑等场景元素，"
+                f"高细节、精致的背景艺术，用于作为游戏主视觉 Key Art。"
             ),
             filename="key_art_main",
             force_gemini=True,
@@ -564,10 +612,12 @@ async def generate_art_samples(session_id: str):
             category=AssetCategory.background,
             prompt=(
                 f"{style_prefix}"
-                f"游戏主战斗场景背景图，{style}风格，{theme}题材，"
-                f"横版场景，无角色，无UI，无文字，"
-                f"氛围感强烈，色彩符合游戏世界观，光影层次丰富，"
-                f"适合做游戏战斗界面背景，高品质环境艺术，16:9比例。"
+                f"游戏主战斗场景可平铺背景图，{style} 风格，{theme} 题材，"
+                f"横版 16:9 场景，画面由可重复的视觉元素块构成，例如地面纹理、建筑片段、远景层次等，"
+                f"左右和上下任意拼接多张时衔接自然、无明显接缝，好像一幅连续的大图，"
+                f"纯环境氛围，没有角色、没有 UI、没有文字，"
+                f"光影与色调严格贴合游戏世界观，层次分明、氛围浓郁，"
+                f"适合用作战斗界面背景的高品质环境艺术。"
             ),
             filename="bg_main_scene",
             force_gemini=True,
@@ -577,9 +627,13 @@ async def generate_art_samples(session_id: str):
             category=AssetCategory.character,
             prompt=(
                 f"{style_prefix}"
-                f"游戏主角「{protagonist}」卡通角色形象，{style}风格，"
-                f"Q版/扁平插画，全身完整可见，外轮廓清晰，造型可爱且有辨识度，"
-                f"适合H5游戏内直接使用的角色精灵，纯色或透明背景，无背景场景元素，无文字。"
+                f"游戏主角「{protagonist}」的角色立绘，{style} 风格，"
+                f"画面中只有一个角色，禁止出现第二个角色或怪物，"
+                f"角色全身完整可见，头部、四肢和武器都在画面内，外轮廓清晰，"
+                f"造型有辨识度并与世界观气质一致，"
+                f"背景为纯色或干净的渐变背景，或者透明背景，不包含具体场景元素，"
+                f"画面中不要任何文字、水印或 UI，"
+                f"适合作为 H5 游戏中主角精灵的基础立绘。"
             ),
             filename="char_protagonist_sample",
             force_gemini=True,
@@ -653,13 +707,22 @@ def _save_game_file(session_id: str, html: str) -> str:
     return f"/static/games/{session_id}/index.html"
 
 
+def _save_game_files(session_id: str, files: dict[str, str]) -> str:
+    """将多个游戏文件保存到 static/games/{session_id}/ 目录，返回 index.html 的访问路径。"""
+    game_dir = _GAMES_DIR / session_id
+    game_dir.mkdir(parents=True, exist_ok=True)
+    for filename, content in files.items():
+        (game_dir / filename).write_text(content, encoding="utf-8")
+    return f"/static/games/{session_id}/index.html"
+
+
 @router.get("/{session_id}/generate-code")
 async def generate_game_code(session_id: str):
     """
-    流式生成 H5 Phaser.js 游戏代码。
+    流式生成 H5 Phaser.js 游戏代码（多文件版：data.js + game.js + 模板）。
     完成后：
-      1. 存入 LangGraph 状态（game_code）
-      2. 保存为 static/games/{session_id}/index.html 文件
+      1. 存入 LangGraph 状态（game_code 为内联 HTML，game_files 为各文件内容）
+      2. 保存为 static/games/{session_id}/ 下的多个文件
     """
     from agents.code_generator import generate_game_code_stream
 
@@ -673,17 +736,27 @@ async def generate_game_code(session_id: str):
 
     async def event_gen():
         game_code_buf = ""
+        game_files = {}
         async for event in generate_game_code_stream(sv):
             if event["type"] == "done":
                 game_code_buf = event["game_code"]
+                game_files = event.get("files", {})
+
                 # 1. 持久化到 LangGraph 状态
-                await graph.aupdate_state(
-                    config,
-                    {"game_code": game_code_buf, "current_stage": "game_ready"},
-                )
-                # 2. 保存为静态文件，方便直接分享/下载
+                state_update = {
+                    "game_code": game_code_buf,
+                    "current_stage": "game_ready",
+                }
+                if game_files:
+                    state_update["game_files"] = game_files
+                await graph.aupdate_state(config, state_update)
+
+                # 2. 保存多文件到磁盘
                 try:
-                    file_path = _save_game_file(session_id, game_code_buf)
+                    if game_files:
+                        file_path = _save_game_files(session_id, game_files)
+                    else:
+                        file_path = _save_game_file(session_id, game_code_buf)
                     logger.info("游戏文件已保存：%s", file_path)
                 except Exception as e:
                     logger.warning("保存游戏文件失败（不影响主流程）: %s", e)
@@ -707,15 +780,14 @@ async def generate_game_code(session_id: str):
 @router.get("/{session_id}/review-code")
 async def review_game_code(session_id: str):
     """
-    对已生成的 H5 游戏代码进行 AI 审查：
-    - 检查玩法完整性（战斗循环、卡牌交互、胜负判断）
-    - 检查美术资源使用（key 对齐、降级逻辑、相对路径）
-    - 自动修复，返回 diff + 修改原因
-    - 修复后的代码更新到 state 和文件
+    对已生成的游戏代码进行 AI 审查（效果注册表架构版）：
+    - 审查 scenes.js（场景层），data.js + effects.js 作为只读上下文
+    - 检查代码正确性、完整性、截断修复
+    - 修复后更新 state + 多文件
     SSE 事件：progress / token / issue / fix / diff_ready / summary / done / error
     """
     from agents.code_reviewer import review_game_code_stream
-    from agents.code_generator import _build_art_manifest
+    from agents.code_generator import _build_art_manifest, assemble_full_html
 
     graph = get_graph()
     config = {"configurable": {"thread_id": session_id}}
@@ -724,38 +796,170 @@ async def review_game_code(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     sv = state_snapshot.values
+    game_files = sv.get("game_files") or {}
     original_html = sv.get("game_code", "") or ""
-    if not original_html:
+
+    if not game_files and not original_html:
         raise HTTPException(status_code=400, detail="尚未生成游戏代码，请先调用 /generate-code")
 
-    # 构建美术资源清单供审查参考
     art_manifest = _build_art_manifest(sv)
 
+    data_js = game_files.get("data.js", "")
+    effects_js = game_files.get("effects.js", "")
+    scenes_js = game_files.get("scenes.js", "")
+    main_js = game_files.get("main.js", "")
+
     async def event_gen():
-        final_code = original_html
-        async for event in review_game_code_stream(original_html, art_manifest):
-            if event["type"] == "done":
-                final_code = event.get("game_code", original_html)
-                changed = event.get("changed", False)
+        if scenes_js:
+            async for event in review_game_code_stream(
+                scenes_js, art_manifest,
+                data_js_context=data_js,
+                effects_js_context=effects_js,
+            ):
+                if event["type"] == "done":
+                    fixed_scenes_js = event.get("game_code", scenes_js)
+                    changed = event.get("changed", False)
 
-                # 若代码有变更，更新 state + 文件
-                if changed and final_code:
-                    try:
-                        await graph.aupdate_state(config, {
-                            "game_code":     final_code,
-                            "current_stage": "code_reviewed",
-                        })
-                        _save_game_file(session_id, final_code)
-                        logger.info("审查后代码已更新：session=%s changed_lines=%s",
-                                    session_id, event.get("changed_lines", 0))
-                    except Exception as e:
-                        logger.warning("保存审查后代码失败：%s", e)
+                    if changed and fixed_scenes_js:
+                        try:
+                            updated_files = {**game_files, "scenes.js": fixed_scenes_js}
+                            sr = sv.get("structured_req") or {}
+                            title = sr.get("title") or sr.get("theme") or "Roguelike Game"
+                            assembled = assemble_full_html(
+                                title, data_js, effects_js, fixed_scenes_js, main_js,
+                            )
 
-            yield _sse(event["type"], event)
+                            await graph.aupdate_state(config, {
+                                "game_code":     assembled,
+                                "game_files":    updated_files,
+                                "current_stage": "code_reviewed",
+                            })
+                            _save_game_files(session_id, updated_files)
+                            logger.info("审查后 scenes.js 已更新：session=%s", session_id)
+                        except Exception as e:
+                            logger.warning("保存审查后代码失败：%s", e)
+
+                yield _sse(event["type"], event)
+        elif game_files.get("game.js"):
+            game_js = game_files["game.js"]
+            async for event in review_game_code_stream(
+                game_js, art_manifest, data_js_context=data_js
+            ):
+                if event["type"] == "done":
+                    fixed_game_js = event.get("game_code", game_js)
+                    changed = event.get("changed", False)
+                    if changed and fixed_game_js:
+                        try:
+                            updated_files = {**game_files, "game.js": fixed_game_js}
+                            sr = sv.get("structured_req") or {}
+                            title = sr.get("title") or sr.get("theme") or "Roguelike Game"
+                            assembled = assemble_full_html(
+                                title, data_js, effects_js, fixed_game_js, main_js or "",
+                            )
+                            await graph.aupdate_state(config, {
+                                "game_code": assembled,
+                                "game_files": updated_files,
+                                "current_stage": "code_reviewed",
+                            })
+                            _save_game_files(session_id, updated_files)
+                        except Exception as e:
+                            logger.warning("保存审查后代码失败：%s", e)
+                yield _sse(event["type"], event)
+        else:
+            async for event in review_game_code_stream(original_html, art_manifest):
+                if event["type"] == "done":
+                    final_code = event.get("game_code", original_html)
+                    changed = event.get("changed", False)
+                    if changed and final_code:
+                        try:
+                            await graph.aupdate_state(config, {
+                                "game_code":     final_code,
+                                "current_stage": "code_reviewed",
+                            })
+                            _save_game_file(session_id, final_code)
+                        except Exception as e:
+                            logger.warning("保存审查后代码失败：%s", e)
+                yield _sse(event["type"], event)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── 游戏代码实时修改 SSE ─────────────────────────────────────
+@router.get("/{session_id}/modify-code")
+async def modify_game_code(session_id: str, instruction: str = ""):
+    """
+    根据用户的自然语言指令修改游戏代码（补丁式，不全文件重写）。
+    SSE 事件：progress / token / analysis / patch_result / done / error
+    """
+    from agents.code_modifier import modify_game_code_stream
+    from agents.code_generator import assemble_full_html
+
+    if not instruction.strip():
+        raise HTTPException(status_code=400, detail="instruction 参数不能为空")
+
+    graph = get_graph()
+    config = {"configurable": {"thread_id": session_id}}
+    state_snapshot = await graph.aget_state(config)
+    if not state_snapshot:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    sv = state_snapshot.values
+    game_files = sv.get("game_files") or {}
+
+    if not game_files:
+        raise HTTPException(status_code=400, detail="尚未生成多文件游戏代码")
+
+    async def event_gen():
+        async for event in modify_game_code_stream(game_files, instruction):
+            if event["type"] == "done":
+                updated_files = event.get("updated_files", {})
+                changed_files = event.get("changed_files", [])
+
+                if changed_files:
+                    try:
+                        merged = {**game_files, **{k: updated_files[k] for k in changed_files}}
+
+                        sr = sv.get("structured_req") or {}
+                        title = sr.get("title") or sr.get("theme") or "Roguelike Game"
+                        # 防御 None 导致 assemble_full_html 或 _save_game_files 报错
+                        assembled = assemble_full_html(
+                            title or "Roguelike Game",
+                            merged.get("data.js") or "",
+                            merged.get("effects.js") or "",
+                            merged.get("scenes.js") or "",
+                            merged.get("main.js") or "",
+                        )
+
+                        await graph.aupdate_state(config, {
+                            "game_code":  assembled,
+                            "game_files": merged,
+                        })
+                        _save_game_files(session_id, {k: (v or "") for k, v in merged.items()})
+                        logger.info(
+                            "modify-code 已保存：session=%s, changed=%s",
+                            session_id, changed_files,
+                        )
+                    except Exception as e:
+                        logger.warning("modify-code 保存失败：%s", e)
+
+                yield _sse("done", {
+                    "changed_files":  changed_files,
+                    "success_count":  event.get("success_count", 0),
+                    "fail_count":     event.get("fail_count", 0),
+                    "analysis":       event.get("analysis") or "",
+                })
+            else:
+                evt_type = event.get("type") or "unknown"
+                yield _sse(evt_type, event)
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _with_heartbeat(event_gen()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -795,6 +999,251 @@ async def get_game_html(session_id: str):
     return HTMLResponse(content=game_code)
 
 
+# ── 下载游戏 ZIP（HTML + assets/ 图片）─────────────────────────
+_ART_DIR = Path(__file__).parent.parent / "static" / "art"
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg"}
+
+
+def _find_art_file(art_base: Path, file_rel: str) -> Path | None:
+    """查找美术文件：先精确路径，再按文件名递归搜索（兼容 samples/ 等子目录）。"""
+    import re as _re
+    candidates = [art_base / file_rel]
+    # 规范化：去除可能的查询参数、锚点
+    file_rel_clean = _re.sub(r"[?#].*$", "", file_rel).strip()
+    if file_rel_clean != file_rel:
+        candidates.insert(0, art_base / file_rel_clean)
+    for p in candidates:
+        if p.is_file() and p.suffix.lower() in _IMG_EXTS:
+            return p
+    # 递归搜索：按文件名在 art_base 下查找
+    stem, ext = Path(file_rel).stem, Path(file_rel).suffix.lower()
+    if ext not in _IMG_EXTS:
+        return None
+    for f in art_base.rglob(f"*{ext}"):
+        if f.is_file() and f.stem == stem:
+            return f
+    return None
+
+
+def _rewrite_art_paths(html: str, session_id: str) -> tuple[str, list[tuple[str, Path]]]:
+    """
+    将 /static/art/{session_id}/... 路径改写为 ./assets/xxx.ext，
+    返回 (改写后的内容, [(zip 内相对路径, 磁盘绝对路径), ...])。
+    支持子目录（如 samples/），文件不存在时按文件名递归查找。
+    """
+    import re as _re
+
+    art_base = _ART_DIR / session_id
+    collected: dict[str, Path] = {}  # zip_rel_path → disk_path
+
+    def _replace(m):
+        url = m.group(0)
+        parts = url.split(f"/static/art/{session_id}/", 1)
+        if len(parts) < 2:
+            return url
+        file_rel = parts[1]
+        disk = _find_art_file(art_base, file_rel)
+        if not disk:
+            return url
+        asset_name = disk.name
+        zip_rel = f"assets/{asset_name}"
+        collected[zip_rel] = disk
+        return f"./{zip_rel}"
+
+    pattern = _re.compile(
+        rf"/static/art/{_re.escape(session_id)}/[^\s\"'<>)}}]+",
+    )
+    new_html = pattern.sub(_replace, html)
+    return new_html, list(collected.items())
+
+
+@router.get("/{session_id}/download-game")
+async def download_game(session_id: str):
+    """
+    下载游戏 ZIP 包（多文件版）：
+      game-name/
+        index.html
+        style.css
+        data.js          （图片路径已改为 ./assets/xxx.ext）
+        game.js
+        assets/
+          phaser.min.js
+          bg_main_scene.jpg
+          ...
+    解压后双击 index.html 即可在浏览器中离线游玩。
+    """
+    import io
+    import zipfile
+    from urllib.parse import quote
+    from starlette.responses import Response
+
+    graph = get_graph()
+    config = {"configurable": {"thread_id": session_id}}
+    state_snapshot = await graph.aget_state(config)
+    if not state_snapshot:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    sv = state_snapshot.values
+    game_files = sv.get("game_files") or {}
+    game_code = sv.get("game_code", "")
+
+    if not game_files and not game_code:
+        raise HTTPException(status_code=400, detail="游戏代码尚未生成")
+
+    structured_req = sv.get("structured_req") or {}
+    title = structured_req.get("theme", "") or structured_req.get("title", "") or "roguelike"
+    safe_title = "".join(
+        c for c in title if c.isalnum() or c in "_-" or '\u4e00' <= c <= '\u9fff'
+    )[:30] or "game"
+    folder_name = f"{safe_title}-{session_id[:8]}"
+    zip_filename = f"{folder_name}.zip"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if game_files:
+            data_js    = game_files.get("data.js", "")
+            effects_js = game_files.get("effects.js", "")
+            scenes_js  = game_files.get("scenes.js", "")
+            main_js_c  = game_files.get("main.js", "")
+            style_css  = game_files.get("style.css", "")
+            game_js_legacy = game_files.get("game.js", "")
+
+            all_js_contents = [data_js, effects_js, scenes_js, main_js_c, game_js_legacy]
+            asset_entries: dict[str, Path] = {}
+            rewritten_js: list[str] = []
+            for js_content in all_js_contents:
+                if js_content:
+                    rw, entries = _rewrite_art_paths(js_content, session_id)
+                    rewritten_js.append(rw)
+                    asset_entries.update(dict(entries))
+                else:
+                    rewritten_js.append("")
+
+            data_js_dl, effects_js_dl, scenes_js_dl, main_js_dl, game_js_dl = rewritten_js
+
+            has_effects = bool(effects_js)
+
+            if has_effects:
+                dl_index = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>{title}</title>
+<link rel="stylesheet" href="style.css">
+<script src="./assets/phaser.min.js"></script>
+</head>
+<body>
+<script src="data.js"></script>
+<script src="effects.js"></script>
+<script src="scenes.js"></script>
+<script src="main.js"></script>
+</body>
+</html>"""
+            else:
+                dl_index = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>{title}</title>
+<link rel="stylesheet" href="style.css">
+<script src="./assets/phaser.min.js"></script>
+</head>
+<body>
+<script src="data.js"></script>
+<script src="game.js"></script>
+</body>
+</html>"""
+
+            default_css = "* {margin:0;padding:0;} body {background:#000;overflow:hidden;display:flex;justify-content:center;align-items:center;height:100vh;}"
+            zf.writestr(f"{folder_name}/index.html", dl_index.encode("utf-8"))
+            zf.writestr(f"{folder_name}/style.css", (style_css or default_css).encode("utf-8"))
+            zf.writestr(f"{folder_name}/data.js", data_js_dl.encode("utf-8"))
+
+            if has_effects:
+                zf.writestr(f"{folder_name}/effects.js", effects_js_dl.encode("utf-8"))
+                zf.writestr(f"{folder_name}/scenes.js", scenes_js_dl.encode("utf-8"))
+                zf.writestr(f"{folder_name}/main.js", main_js_dl.encode("utf-8"))
+            else:
+                zf.writestr(f"{folder_name}/game.js", game_js_dl.encode("utf-8"))
+
+            for zip_rel, disk_path in asset_entries.items():
+                zf.write(disk_path, f"{folder_name}/{zip_rel}")
+        else:
+            game_code_dl, asset_entries = _rewrite_art_paths(game_code, session_id)
+            zf.writestr(f"{folder_name}/index.html", game_code_dl.encode("utf-8"))
+            for zip_rel, disk_path in asset_entries:
+                zf.write(disk_path, f"{folder_name}/{zip_rel}")
+
+        # 确保 phaser.min.js 始终打入 zip（离线可玩）
+        phaser_url = "https://cdn.jsdelivr.net/npm/phaser@3.88.2/dist/phaser.min.js"
+        phaser_cache = Path(__file__).parent.parent / "static" / "cache" / "phaser.min.js"
+        phaser_bytes: bytes | None = None
+        if phaser_cache.is_file():
+            phaser_bytes = phaser_cache.read_bytes()
+        else:
+            try:
+                import httpx
+                with httpx.Client(follow_redirects=True, timeout=30) as client:
+                    r = client.get(phaser_url)
+                    r.raise_for_status()
+                    phaser_bytes = r.content
+                # 写入缓存供后续使用
+                phaser_cache.parent.mkdir(parents=True, exist_ok=True)
+                phaser_cache.write_bytes(phaser_bytes)
+            except Exception as e:
+                logger.warning("无法获取 phaser.min.js，下载包可能无法离线运行: %s", e)
+        if phaser_bytes:
+            zf.writestr(f"{folder_name}/assets/phaser.min.js", phaser_bytes)
+
+        # file:// 下 WebGL 无法加载图片纹理，必须用本地 HTTP 服务器
+        readme = (
+            "【运行说明】\n\n"
+            "直接双击 index.html 会报 CORS 错误。请用本地服务器：\n\n"
+            "Mac:\n"
+            "  若双击 启动游戏.command 弹出安全警告，请右键该文件 → 选「打开」即可。\n"
+            "  或打开终端，cd 到本目录，执行：\n"
+            "    xattr -d com.apple.quarantine 启动游戏.command   # 解除隔离\n"
+            "    然后双击 启动游戏.command\n"
+            "  或手动执行：python3 -m http.server 8080，再访问 http://localhost:8080\n\n"
+            "Windows:\n"
+            "  双击 启动游戏.bat\n"
+        )
+        zf.writestr(f"{folder_name}/使用说明.txt", readme.encode("utf-8"))
+        _cmd = zipfile.ZipInfo(f"{folder_name}/启动游戏.command")
+        _cmd.external_attr = 0o100755 << 16
+        # PATH 确保 Finder 双击能找到 python3；输出静默减少告警
+        _cmd_content = (
+            "#!/bin/bash\n"
+            'cd "$(dirname "$0")"\n'
+            'export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"\n'
+            "python3 -m http.server 8080 >/dev/null 2>&1 &\n"
+            "sleep 1.5\n"
+            'open "http://localhost:8080" 2>/dev/null || echo "请手动打开: http://localhost:8080"\n'
+            "wait\n"
+        )
+        zf.writestr(_cmd, _cmd_content.encode("utf-8"))
+        _bat = "@echo off\ncd /d %~dp0\necho 启动中...\nstart python -m http.server 8080\ntimeout /t 2 /nobreak >nul\nstart http://localhost:8080\necho 关闭服务器窗口可停止\npause\n"
+        zf.writestr(f"{folder_name}/启动游戏.bat", _bat.encode("utf-8"))
+
+    zip_bytes = buf.getvalue()
+    ascii_fallback = f"game-{session_id[:8]}.zip"
+    encoded_name = quote(zip_filename)
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_fallback}"; '
+                f"filename*=UTF-8''{encoded_name}"
+            ),
+        },
+    )
+
+
 # ── 美术生成 SSE ────────────────────────────────────────────────
 @router.get("/{session_id}/generate-art")
 async def generate_art(session_id: str):
@@ -825,21 +1274,26 @@ async def generate_art(session_id: str):
         logger.warning("sec_art 解析任务为空，降级使用默认任务列表（game_title=%s）", game_title)
         tasks = build_default_tasks(game_title)
 
-    # ── 复用样图阶段已确认的背景图和主角，避免重复生成 ──────────
+    # ── 扫描磁盘：找出本次已存在的文件（断点续传，注入 reuse_url）──
     art_samples: dict = sv.get("art_samples") or {}
+    disk_existing = _scan_art_dir(session_id)  # {stem: url_path}
 
-    # 从 art_samples URL 中获取可复用的图片
-    _bg_reuse_url    = art_samples.get("bg_main_scene")
-    _char_reuse_url  = art_samples.get("char_protagonist_sample")
+    # 从 art_samples 补充背景/主角复用 URL
+    _bg_reuse_url   = art_samples.get("bg_main_scene")
+    _char_reuse_url = art_samples.get("char_protagonist_sample")
 
     def _reuse_url_for(task: "ArtTask") -> str | None:
-        """宽松匹配：背景图精确匹配文件名；主角匹配所有 char_protagonist* 变体。"""
+        """优先用磁盘文件；再检查 art_samples（背景/主角）。"""
+        # 磁盘已有同名文件（任意扩展名）→ 直接复用，不花钱
+        if task.filename in disk_existing:
+            url = disk_existing[task.filename]
+            logger.info("断点续传：磁盘已有 %s → %s", task.filename, url)
+            return url
+        # 样图阶段的背景/主角复用
         fn = task.filename.lower()
         if _bg_reuse_url and fn == "bg_main_scene":
-            logger.info("全量生成复用背景样图 → %s", _bg_reuse_url)
             return _bg_reuse_url
         if _char_reuse_url and (fn == "char_protagonist" or fn.startswith("char_protagonist")):
-            logger.info("全量生成复用主角样图 → %s (%s)", task.filename, _char_reuse_url)
             return _char_reuse_url
         return None
 
@@ -856,18 +1310,38 @@ async def generate_art(session_id: str):
         for t in tasks
     ]
 
+    reused_count  = sum(1 for t in tasks if t.reuse_url)
+    new_count     = len(tasks) - reused_count
+    logger.info(
+        "generate_art：总任务 %d，复用 %d，需生成 %d（session=%s）",
+        len(tasks), reused_count, new_count, session_id,
+    )
+
     collected: dict = {}
+    # 把磁盘已有文件先填入 collected（防止 complete 事件覆盖掉）
+    collected.update(disk_existing)
     total_tasks = len(tasks)
+    _PERSIST_EVERY = 3   # 每完成 N 张就持久化一次 state，防止中断丢失
 
     async def event_gen():
         # 立即推送 ready 事件，让前端知道连接成功、任务数已确定
-        yield _sse("ready", {"total": total_tasks, "message": f"准备生成 {total_tasks} 张美术资源"})
+        yield _sse("ready", {"total": total_tasks, "message": f"准备生成 {total_tasks} 张美术资源（跳过已有 {reused_count} 张）"})
 
+        done_count = 0
         async for event in run_art_pipeline(tasks, session_id):
             if event["type"] == "done":
                 collected[event["task"]] = event["url_path"]
+                done_count += 1
+                # 每完成 N 张增量持久化，防止连接中断导致 state 丢失
+                if done_count % _PERSIST_EVERY == 0:
+                    await graph.aupdate_state(config, {"art_assets": dict(collected)})
+                    logger.info("generate_art 增量持久化：%d 张已写入 state", done_count)
             elif event["type"] == "complete":
-                await graph.aupdate_state(config, {"art_assets": collected})
+                # 最终持久化：写入 art_assets 并将 art_phase 置为 3（真正完成信号）
+                await graph.aupdate_state(config, {
+                    "art_assets": dict(collected),
+                    "art_phase": 3,
+                })
             yield _sse(event["type"], event)
         yield "data: [DONE]\n\n"
 
@@ -879,5 +1353,46 @@ async def generate_art(session_id: str):
 
 
 # ── 工具函数 ───────────────────────────────────────────────────
+_HEARTBEAT_INTERVAL = 15  # 每 15 秒发送一次心跳，防止连接被中间件/浏览器断开
+_SENTINEL = object()
+
+
+async def _with_heartbeat(agen, interval: int = _HEARTBEAT_INTERVAL):
+    """包装一个异步生成器，在无数据时定期发送 SSE 注释行保活。
+    使用 asyncio.Queue 中转，避免 wait_for 的 cancel 破坏底层生成器。
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _pump():
+        try:
+            async for item in agen:
+                await queue.put(item)
+        except Exception as exc:
+            await queue.put(exc)
+        finally:
+            await queue.put(_SENTINEL)
+
+    pump_task = asyncio.create_task(_pump())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+            if item is _SENTINEL:
+                break
+            if isinstance(item, Exception):
+                logger.error("SSE 事件流异常: %s", item)
+                break
+            yield item
+    finally:
+        pump_task.cancel()
+        try:
+            await pump_task
+        except asyncio.CancelledError:
+            pass
+
+
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

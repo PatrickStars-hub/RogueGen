@@ -241,14 +241,21 @@ async def run_art_pipeline(
             if "transparent" not in prompt.lower():
                 suffixes.append("transparent background, PNG with alpha channel, isolated subject, no background")
 
-            # 角色：卡通游戏精灵风格，全身可见，构图紧凑
+            # 角色：单个角色居中，全身可见，禁止多角色/精灵表
             if task.category in _CHARACTER_CATEGORIES:
-                if "cartoon" not in prompt.lower() and "卡通" not in prompt:
-                    suffixes.append(
-                        "cartoon game character sprite style, chibi or flat illustration, "
-                        "full body visible, compact composition, clear silhouette, "
-                        "suitable for H5 game use, no cropping"
-                    )
+                # 强制单角色约束（防止生成精灵表或双角色对比图）
+                suffixes.append(
+                    "single character only, one character centered in frame, "
+                    "no sprite sheet, no multiple characters, no side-by-side poses, "
+                    "full body visible, clear silhouette, suitable for H5 game sprite"
+                )
+                # 仅在 prompt 未指定任何风格时补充兜底风格（不强制 chibi）
+                has_style = any(w in prompt.lower() for w in (
+                    "cartoon", "卡通", "pixel", "像素", "realistic", "写实",
+                    "chibi", "q版", "flat", "扁平", "anime", "动漫"
+                ))
+                if not has_style:
+                    suffixes.append("2D game art style, clean linework")
 
             # 图标：明确尺寸 + 完整可见 + 图标构图
             if task.category in _ICON_CATEGORIES:
@@ -286,7 +293,25 @@ async def run_art_pipeline(
             result = ArtResult(task=task, local_path="", url_path=task.reuse_url)
             results.append(result)
             yield {"type": "done", "task": task.filename, "url_path": task.reuse_url,
-                   "local_path": "", "reused": True}
+                   "local_path": "", "reused": True, "category": task.category.value}
+            continue
+
+        # ── 断点续传：检查磁盘文件是否已存在，避免重复调用 API ──
+        import os as _os
+        _art_dir = _os.path.join("static", "art", session_id)
+        _disk_hit = False
+        for _ext in (".png", ".jpg", ".jpeg", ".webp"):
+            _candidate = _os.path.join(_art_dir, task.filename + _ext)
+            if _os.path.exists(_candidate):
+                _url = "/" + _candidate.replace("\\", "/")
+                logger.info("磁盘文件已存在，跳过 API 调用：%s → %s", task.filename, _url)
+                result = ArtResult(task=task, local_path=_candidate, url_path=_url)
+                results.append(result)
+                yield {"type": "done", "task": task.filename, "url_path": _url,
+                       "local_path": _candidate, "reused": True, "category": task.category.value}
+                _disk_hit = True
+                break
+        if _disk_hit:
             continue
 
         try:

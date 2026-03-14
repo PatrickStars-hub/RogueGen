@@ -46,8 +46,11 @@ class GameDesignState(TypedDict):
     # 当前迭代轮次
     iteration_count: int
 
-    # 生成的 H5 游戏代码（完整 HTML，可直接在浏览器运行）
+    # 生成的 H5 游戏代码（完整内联 HTML，向后兼容）
     game_code: Optional[str]
+
+    # 多文件版游戏代码 {"data.js": ..., "game.js": ..., "index.html": ..., "style.css": ...}
+    game_files: Optional[dict]
 
     # 生成的美术资源清单 {filename: url_path}
     art_assets: Optional[dict]

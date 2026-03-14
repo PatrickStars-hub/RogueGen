@@ -30,7 +30,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from config import settings
 
@@ -126,6 +126,10 @@ def process_image(
         img = img.convert("RGBA")
 
     img = _cover_crop(img, asset.width, asset.height)
+
+    # 背景图虚化，突出主角和怪物
+    if spec in (GameAssetSpec.background_hd, GameAssetSpec.background_mobile):
+        img = img.filter(ImageFilter.GaussianBlur(radius=4))
 
     out_dir = _ensure_output_dir(session_id)
     ext = "jpg" if asset.fmt == "JPEG" else "png"

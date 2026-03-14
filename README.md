@@ -333,6 +333,26 @@ CARDS.forEach(card => {
 
 ---
 
+## 下载游戏包运行说明
+
+生成完成后可点击「下载游戏包」，解压后需用本地 HTTP 服务器运行（直接双击 index.html 会报 CORS 错误）。
+
+### Mac
+
+- 若双击 `启动游戏.command` 弹出「无法验证开发者」安全警告，请**右键该文件 → 选「打开」**即可。
+- 或打开终端，`cd` 到解压目录，执行：
+  ```bash
+  xattr -d com.apple.quarantine 启动游戏.command   # 解除隔离
+  ```
+  然后双击 `启动游戏.command`。
+- 或手动执行：`python3 -m http.server 8080`，再访问 http://localhost:8080。
+
+### Windows
+
+- 双击 `启动游戏.bat` 即可。
+
+---
+
 ## License
 
 [MIT](LICENSE)

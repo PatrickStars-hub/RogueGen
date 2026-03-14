@@ -5,8 +5,12 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
     OPENAI_MODEL: str = "gpt-4o"
-    # 代码生成 & 代码审查专用模型
-    CODE_MODEL: str = "openai/gpt-5.3-codex"
+    # 玩法设计专用模型（需要极强的创意 + 结构化输出能力）
+    DESIGN_MODEL: str = "anthropic/claude-opus-4.6"
+    # 代码生成专用模型（Claude Opus 系列，擅长长上下文代码生成）
+    CODE_MODEL: str = "anthropic/claude-opus-4.6"
+    # 代码审查专用模型（独立于生成模型，可换不同厂商交叉校验）
+    REVIEW_MODEL: str = "openai/gpt-5.3-codex"
     PORT: int = 8765
 
     # OpenRouter 可选请求头（使用 OpenRouter 时填写，其他情况留空即可）

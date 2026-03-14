@@ -1,6 +1,7 @@
 """
-H5 游戏代码生成 Agent
-基于已确认的 GDD + 美术资源清单，生成可直接在浏览器运行的 Phaser.js 3 单关卡卡牌战斗原型。
+H5 游戏代码生成 Agent（效果注册表架构）
+拆分为 data.js + effects.js + scenes.js + main.js（模板），
+每步 LLM 调用输出 < 600 行，从根本上解决截断问题。
 """
 from __future__ import annotations
 
@@ -16,40 +17,109 @@ from graph.state import GameDesignState
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# System Prompt
+# 固定模板（无需 LLM 生成）
 # ──────────────────────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """你是资深 H5 游戏工程师，使用 Phaser 3 输出一个 **Roguelike 卡牌原型**。
+_INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>{game_title}</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.88.2/dist/phaser.min.js"></script>
+</head>
+<body>
+<script src="data.js"></script>
+<script src="effects.js"></script>
+<script src="scenes.js"></script>
+<script src="main.js"></script>
+</body>
+</html>"""
 
-## 铁律（违反任何一条 = 不合格）
-1. **只输出纯 HTML**：从 `<!DOCTYPE html>` 到 `</html>` 结束，不加说明文字、markdown 标记
-2. **相对路径**：所有图片 URL 以 `/static/` 开头，禁止 `http://localhost` 等绝对地址
-3. **背景消除**：角色/对手 PNG 必须在 BootScene.create() 中调用 `removeBackground(this, key)` 抠图；**卡牌完整图和背景图不处理**
-4. **卡牌完整图优先**：每张卡牌直接以 `card_{id}` 完整图（320×480，含边框+插画+文字）展示，`setDisplaySize(145, 217)`；图片不存在才降级为程序化卡框
-5. **分辨率**：1280×720，渲染器 `type: Phaser.AUTO`
-6. **Phaser 版本**：`https://cdn.jsdelivr.net/npm/phaser@3.88.2/dist/phaser.min.js`
+_STYLE_CSS = """* { margin:0; padding:0; }
+body { background:#000; overflow:hidden; display:flex; justify-content:center; align-items:center; height:100vh; }
+"""
 
----
+_MAIN_JS_TEMPLATE = """const config = {{
+  type: Phaser.AUTO,
+  width: 1920,
+  height: 1080,
+  scale: {{ mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH }},
+  physics: {{ default: 'arcade', arcade: {{ gravity: {{ y: 0 }}, debug: false }} }},
+  scene: [BootScene, MenuScene, GameScene],
+  backgroundColor: '#000000'
+}};
+const game = new Phaser.Game(config);
+"""
 
-## Roguelike 框架设计原则
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 1 Prompt: data.js — 游戏数据层（不变）
+# ──────────────────────────────────────────────────────────────────────────────
 
-**核心循环**：玩家出牌/使用能力 → 效果生效 → 结束回合 → 对手行动 → 循环直到胜/负。单局单场景，胜负后一键重玩。
+_DATA_SYSTEM_PROMPT = """你是资深 H5 游戏工程师，根据玩法文档生成**数据层 data.js**。
 
-**效果实现规则**：
-- 卡牌效果由玩法文档定义，你需要读懂效果描述并将其翻译为 JavaScript 逻辑
-- CARDS 数组中每张卡的字段按效果自由设计（可有 `value`, `times`, `duration`, `extra` 等任意字段）
-- `playCard` 函数须逐一判断 `card.effect` 并执行对应逻辑，不要遗漏任何效果
-- 对于控制/增益类效果（跳过回合、额外摸牌、持续效果等），使用状态标志或计时器实现
-- 对于特殊异变类（改变游戏规则的效果），大胆实现，但保持可玩性
+## 输出规范
+- 只输出纯 JavaScript 源码，无 markdown/HTML/说明
+- 图片 URL 统一以 `/static/` 开头
+- 数值、名称、效果严格按玩法文档，不遗漏
 
----
+## 输出内容（按顺序）
 
-## 必须实现的全局工具函数（写在所有 Scene 类之前）
-
-### 1. 程序化形象纹理（图片失败时兜底）
+### 1. 全局常量
 ```js
+const GAME_TITLE = '游戏名称';
+const THEME_COLOR = 0xRRGGBB;
+const PLAYER_HP = N;
+const PLAYER_IMG = 'char_protagonist_sample';
+```
+
+### 2. 卡牌池（10张，含 Lv1-Lv3 升级数值）
+```js
+const CARDS = [
+  { id:'xxx', name:'名称', effect:'effect_type', color:0xRRGGBB,
+    levels: [
+      { ...Lv1数值字段, desc:'Lv1描述' },
+      { ...Lv2数值字段, desc:'Lv2描述' },
+      { ...Lv3数值字段, desc:'Lv3描述' }
+    ]},
+];
+```
+每张卡的 `levels` 数组中，每级的数值字段根据该卡效果自定义（如 dmg/radius/interval/chance），但必须包含 `desc` 字段。
+
+### 3. 羁绊（5-7个）
+```js
+const SYNERGIES = [
+  { id:'xxx', name:'名称', requiredCards:['card_a','card_b'],
+    effect:'描述', bonusValue:N, vfxColor:0xRRGGBB },
+];
+```
+
+### 4. 敌人 + Boss（size 为游戏内显示尺寸，须足够大以便辨认）
+```js
+const ENEMIES = [
+  { name:'名称', hp:N, atk:N, speed:N, color:0xRRGGBB, img:'enemy_xxx', size:112, exp:N },
+];
+const BOSS_DATA = { name:'Boss名', hp:N, atk:N, speed:N, color:0xRRGGBB, img:'enemy_xxx', size:220, exp:N };
+```
+ENEMIES 每项 size 建议 100~128，BOSS_DATA 的 size 建议 200~260（PC 端占比约 9~12% / 18~24%）。
+
+### 5. 全局工具函数（必须全部包含，不可省略）
+
+```js
+function hasUsableTexture(scene, key) {
+  return scene.textures.exists(key)
+    && scene.textures.get(key).source
+    && scene.textures.get(key).source[0]
+    && scene.textures.get(key).source[0].width > 4;
+}
+
+// 参数顺序：makeFallbackTexture(scene, key, color, w, h) — 第3个是 color，第4、5 是宽高
 function makeFallbackTexture(scene, key, color, w, h) {
-  if (scene.textures.exists(key) && scene.textures.get(key).source[0].width > 4) return;
+  if (hasUsableTexture(scene, key)) return;
+  if (typeof color === 'number' && color < 2000 && typeof w === 'number' && w > 0xFFFF) {
+    var _t = color; color = w; w = _t;
+  }
   const g = scene.make.graphics({ add: false });
   g.fillStyle(color, 1).fillRoundedRect(0, 0, w, h, 14);
   g.lineStyle(3, 0xffffff, 0.45).strokeRoundedRect(3, 3, w-6, h-6, 12);
@@ -58,77 +128,11 @@ function makeFallbackTexture(scene, key, color, w, h) {
   g.generateTexture(key, w, h);
   g.destroy();
 }
-```
 
-### 2. 状态条（HP/能量/护盾等）
-```js
-function makeHPBar(scene, x, y, w, h, maxHp, fillColor) {
-  scene.add.graphics().fillStyle(0x111111, 0.85).fillRect(x, y, w, h).setDepth(10);
-  const bar = scene.add.graphics().setDepth(11);
-  const txt = scene.add.text(x+w/2, y+h/2, '', {fontSize:'11px', color:'#fff'}).setOrigin(0.5).setDepth(12);
-  const refresh = (cur, max) => {
-    bar.clear();
-    const r = Math.max(0, cur/max);
-    bar.fillStyle(r>0.5 ? fillColor : r>0.25 ? 0xffaa00 : 0xff3333, 1).fillRect(x, y, w*r, h);
-    txt.setText(`${Math.ceil(cur)}/${max}`);
-  };
-  refresh(maxHp, maxHp);
-  return { refresh };
-}
-```
-
-### 3. 卡牌精灵（完整卡牌图直接展示，fallback 为程序化卡框）
-```js
-function makeCard(scene, x, y, card) {
-  // 卡牌图尺寸：320×480 → 游戏内按 145×217 显示（更大尺寸减少缩放模糊）
-  const W=145, H=217;
-  const c = scene.add.container(x, y).setDepth(8).setSize(W, H).setInteractive({useHandCursor:true});
-
-  const imgKey = `card_${card.id}`;
-  const hasImg = scene.textures.exists(imgKey) && scene.textures.get(imgKey).source[0].width > 4;
-
-  if (hasImg) {
-    // 完整卡牌图（含边框+插画+文字），直接缩放展示，不做任何处理
-    const img = scene.add.image(0, 0, imgKey).setDisplaySize(W, H);
-    // 高亮描边（hover 时显示）
-    const hl = scene.add.graphics().lineStyle(3, 0xffd700, 0).strokeRoundedRect(-W/2,-H/2,W,H,6);
-    const costDot = scene.add.graphics().fillStyle(0x000000,0.78).fillCircle(-W/2+15,-H/2+15,14);
-    const costTxt = scene.add.text(-W/2+15,-H/2+15,`${card.cost}`,{fontSize:'15px',color:'#fff',fontStyle:'bold'}).setOrigin(0.5);
-    c.add([img, costDot, costTxt, hl]);
-    c.setData('hl', hl);
-  } else {
-    // fallback：程序化卡框 + 费用 + 卡名 + 效果 emoji
-    const bg = scene.add.graphics();
-    bg.fillStyle(0x0d0d22, 0.96).fillRoundedRect(-W/2,-H/2,W,H,8);
-    bg.lineStyle(2, card.color, 0.9).strokeRoundedRect(-W/2,-H/2,W,H,8);
-    const cg = scene.add.graphics().fillStyle(card.color,1).fillCircle(-W/2+13,-H/2+13,12);
-    const ct = scene.add.text(-W/2+13,-H/2+13,`${card.cost}`,{fontSize:'13px',color:'#fff',fontStyle:'bold'}).setOrigin(0.5);
-    const nt = scene.add.text(0,-H/2+28,card.name,{fontSize:'11px',color:'#fff',fontStyle:'bold',wordWrap:{width:W-12},align:'center'}).setOrigin(0.5);
-    const typeEmoji = {attack:'⚔',defend:'🛡',buff:'✨',control:'❄',special:'🌀'}[card.type]||'✦';
-    const ic = scene.add.text(0,-H/2+86,typeEmoji,{fontSize:'36px'}).setOrigin(0.5);
-    const sep = scene.add.graphics().lineStyle(1,card.color,0.35).lineBetween(-W/2+6,H/2-46,W/2-6,H/2-46);
-    const dt = scene.add.text(0,H/2-26,card.desc,{fontSize:'9px',color:'#ccc',wordWrap:{width:W-10},align:'center'}).setOrigin(0.5);
-    c.add([bg,cg,ct,nt,ic,sep,dt]);
-  }
-
-  return c;
-}
-```
-
-### 4. 飘字动画
-```js
-function floatText(scene, x, y, msg, color) {
-  const t = scene.add.text(x, y, msg, {fontSize:'28px',color:color||'#ff4444',fontStyle:'bold',stroke:'#000',strokeThickness:5}).setOrigin(0.5).setDepth(22);
-  scene.tweens.add({targets:t, y:y-80, alpha:{from:1,to:0}, duration:900, onComplete:()=>t.destroy()});
-}
-```
-
-### 5. 角色背景消除（必须调用，替代 MULTIPLY）
-AI 生成的角色/敌人 PNG 可能带白色底或棋盘格灰底。
-调用此函数可采样四角识别背景色，将其透明化，使精灵无缝融入深色场景。
-```js
+// removeBackground: 完整实现（必须照抄，不可省略或改写）
+// tolerance 控制抠图强度：较小值(20~24)抠图更保守、减少边缘裁切；较大值(35~45)更激进
 function removeBackground(scene, key, tolerance) {
-  tolerance = tolerance || 55;
+  tolerance = tolerance || 34;
   if (!scene.textures.exists(key)) return;
   const src = scene.textures.get(key).source[0];
   const w = src.width, h = src.height;
@@ -154,7 +158,7 @@ function removeBackground(scene, key, tolerance) {
     for (const c of probes.slice(1)) {
       const rgb = c.slice(0,3);
       const similar = bgColors.some(b =>
-        Math.abs(rgb[0]-b[0]) < 35 && Math.abs(rgb[1]-b[1]) < 35 && Math.abs(rgb[2]-b[2]) < 35
+        Math.abs(rgb[0]-b[0]) < 26 && Math.abs(rgb[1]-b[1]) < 26 && Math.abs(rgb[2]-b[2]) < 26
       );
       if (!similar) bgColors.push(rgb);
     }
@@ -171,362 +175,356 @@ function removeBackground(scene, key, tolerance) {
     scene.textures.addCanvas(key, cv);
   } catch(e) { console.warn('removeBackground failed:', key, e); }
 }
+
+function makeCard(scene, x, y, card, lvl) { ... }         // 仅展示图片，不叠加任何文字
+function floatText(scene, x, y, msg, color) { ... }       // 飘字动画
+function makeHPBar(scene, x, y, w, h, maxVal, fillColor) { ... } // 状态条
 ```
 
----
+**removeBackground**：已给出完整实现，照抄即可。**makeCard**：**只展示图片**。有 `card_{id}` 纹理时，仅用 add.image + setDisplaySize(400,600) 展示该纹理，**不添加** card.name、card.desc、Lv、描边、按钮等任何叠加内容；无纹理时用 makeFallbackTexture 后同样仅展示占位图。卡牌图已含完整设计，展示尺寸 400×600 或以上。
 
-## 三个 Scene（必须完整实现）
+## 禁止
+本文件只输出 data.js 内容。不输出 Scene 类、EFFECT_REGISTRY、Phaser.Game config、HTML/CSS/markdown。"""
 
-### BootScene
-```js
-class BootScene extends Phaser.Scene {
-  constructor(){super('Boot')}
-  preload(){
-    // ★ 逐行加载所有美术资源（相对路径）：
-    //   背景图：this.load.image('bg_main', '/static/art/SESSION_ID/bg_main_scene.jpg');
-    //   主角：  this.load.image(PLAYER_IMG, '/static/art/SESSION_ID/char_protagonist.png');
-    //   对手：  对每个对手一行，key = 对手的 img 字段
-    //   卡牌图标（每张卡牌一行，key = 'card_{card.id}'）：
-    //           this.load.image('card_xxx', '/static/art/SESSION_ID/card_xxx.png');
-    //   其他资源：按美术清单逐行添加
-    const bar=this.add.graphics();
-    this.load.on('progress',v=>{bar.clear().fillStyle(THEME_COLOR,1).fillRect(240,354,800*v,12);});
-  }
-  create(){
-    makeFallbackTexture(this, PLAYER_IMG, 0x3366cc, 160, 160);
-    OPPONENTS.forEach(e=>makeFallbackTexture(this, e.img, e.color, 160, 160));
-    // ★ 背景消除：对所有角色/敌人图调用 removeBackground（消除白底或棋盘格灰底）
-    removeBackground(this, PLAYER_IMG);
-    OPPONENTS.forEach(e => removeBackground(this, e.img));
-    // ★ 卡牌纹理切换为 NEAREST 采样，消除双线性滤波糊化，保持图像锐利
-    CARDS.forEach(card => {
-      const key = `card_${card.id}`;
-      if (this.textures.exists(key) && this.textures.get(key).source[0].width > 4) {
-        this.textures.get(key).setFilter(Phaser.Textures.FilterMode.NEAREST);
-      }
-    });
-    // 背景兜底（渐变深色）
-    if(!this.textures.exists('bg_main')||this.textures.get('bg_main').source[0].width<=4){
-      const g=this.make.graphics({add:false});
-      g.fillGradientStyle(0x0a0a2a,0x0a0a2a,0x1a0a3a,0x1a0a3a,1);
-      g.fillRect(0,0,1280,720); g.generateTexture('bg_main',1280,720); g.destroy();
-    }
-    this.scene.start('Menu');
-  }
-}
-```
 
-### MenuScene
-```js
-class MenuScene extends Phaser.Scene {
-  constructor(){super('Menu')}
-  create(){
-    const hasBg=this.textures.exists('bg_menu')&&this.textures.get('bg_menu').source[0].width>4;
-    this.add.image(640,360,hasBg?'bg_menu':'bg_main').setDisplaySize(1280,720).setDepth(0);
-    const ov=this.add.graphics().setDepth(1);
-    ov.fillGradientStyle(0,0,0,0,0.55,0.55,0,0).fillRect(0,0,1280,400);
-    ov.fillGradientStyle(0,0,0,0,0,0,0.7,0.7).fillRect(0,400,1280,320);
-
-    this.add.text(640,200,GAME_TITLE,{fontSize:'62px',color:'#ffd700',stroke:'#000',strokeThickness:9,fontStyle:'bold'}).setOrigin(0.5).setDepth(5);
-    this.add.text(640,280,'ROGUELIKE',{fontSize:'16px',color:'#aaaaff',letterSpacing:10}).setOrigin(0.5).setDepth(5);
-
-    const hexColor='#'+THEME_COLOR.toString(16).padStart(6,'0');
-    const btn=this.add.text(640,420,'  开始游戏  ',{fontSize:'34px',backgroundColor:hexColor,padding:{x:30,y:14},color:'#fff'})
-      .setOrigin(0.5).setInteractive({useHandCursor:true}).setDepth(5);
-    btn.on('pointerover',()=>btn.setAlpha(0.8));
-    btn.on('pointerout',()=>btn.setAlpha(1));
-    btn.on('pointerdown',()=>this.scene.start('Battle'));
-  }
-}
-```
-
-### BattleScene（核心，完整实现）
-```js
-class BattleScene extends Phaser.Scene {
-  constructor(){super('Battle')}
-
-  create(){
-    // ── 状态初始化（按游戏类型可扩展字段）──
-    this.pl = {hp:PLAYER_HP, maxHp:PLAYER_HP, shield:0, energy:MAX_ENERGY, maxEnergy:MAX_ENERGY};
-    // 从 OPPONENTS 随机选一个
-    const oi = Phaser.Math.Between(0, OPPONENTS.length-1);
-    this.en = {...OPPONENTS[oi], hp:OPPONENTS[oi].hp, shield:0};
-    this.deck = Phaser.Utils.Array.Shuffle([...STARTER_DECK]);
-    this.hand=[]; this.discard=[]; this.cards=[]; this.busy=false;
-    // ★ 在此添加游戏类型特有的状态字段（如 stun 标志、buff 计数器等）
-
-    // ── 背景与遮罩 ──
-    const hasBg=this.textures.exists('bg_main')&&this.textures.get('bg_main').source[0].width>4;
-    this.add.image(640,360,hasBg?'bg_main':'bg_main').setDisplaySize(1280,720).setDepth(0);
-    this.add.graphics().fillStyle(0x000000,0.55).fillRect(0,530,1280,190).setDepth(2);
-
-    // ── 主角 Sprite（背景已在 BootScene.create 中消除）──
-    const pReal=this.textures.exists(PLAYER_IMG)&&this.textures.get(PLAYER_IMG).source[0].width>4;
-    this.pSpr=this.add.image(210,330,pReal?PLAYER_IMG:'player_fallback')
-      .setDisplaySize(160,160).setDepth(4);
-
-    // ── 主角 HUD ──
-    this.pHPBar=makeHPBar(this,20,475,220,18,PLAYER_HP,0x2299ff);
-    this.add.text(20,456,'HP',{fontSize:'12px',color:'#aaa'}).setDepth(10);
-    this.shTxt=this.add.text(20,496,'护盾: 0',{fontSize:'13px',color:'#88ccff'}).setDepth(10);
-    this.enTxt=this.add.text(20,516,'',{fontSize:'15px',color:'#ffdd44',fontStyle:'bold'}).setDepth(10);
-
-    // ── 对手 Sprite（背景已在 BootScene.create 中消除）──
-    const eReal=this.textures.exists(this.en.img)&&this.textures.get(this.en.img).source[0].width>4;
-    this.eSpr=this.add.image(1000,300,eReal?this.en.img:'enemy_fallback')
-      .setDisplaySize(160,160).setDepth(4);
-    if(!eReal) this.eSpr.setTint(this.en.color);
-
-    // ── 对手 HUD ──
-    this.eHPBar=makeHPBar(this,870,140,210,18,this.en.hp,0x22bb44);
-    this.add.text(870,120,this.en.name,{fontSize:'15px',color:'#ffdd44',fontStyle:'bold'}).setDepth(10);
-    this.intTxt=this.add.text(870,162,'',{fontSize:'12px',color:'#ffaaaa'}).setDepth(10);
-
-    // ── 结束回合 ──
-    const eb=this.add.text(1155,660,'结束回合',{fontSize:'18px',backgroundColor:'#332211',padding:{x:14,y:8},color:'#ffdd88'})
-      .setOrigin(0.5).setInteractive({useHandCursor:true}).setDepth(10);
-    eb.on('pointerover',()=>eb.setAlpha(0.75));
-    eb.on('pointerout',()=>eb.setAlpha(1));
-    eb.on('pointerdown',()=>{if(!this.busy)this.endTurn();});
-
-    this.startTurn();
-  }
-
-  startTurn(){
-    this.pl.energy=this.pl.maxEnergy;
-    this.pl.shield=0;
-    // ★ 回合开始时处理持续效果（如已有 stun 则不减）
-    for(let i=0;i<5-this.hand.length;i++){
-      if(!this.deck.length){this.deck=Phaser.Utils.Array.Shuffle(this.discard.splice(0));}
-      if(this.deck.length) this.hand.push(this.deck.pop());
-    }
-    this.renderHand(); this.updateHUD();
-    // 显示对手意图（按对手数据）
-    this.intTxt.setText(`意图：攻击 ${this.en.atk}`);
-  }
-
-  renderHand(){
-    this.cards.forEach(c=>c.destroy()); this.cards=[];
-    const n=this.hand.length, gap=120, sx=640-(n-1)*gap/2;
-    this.hand.forEach((cid,i)=>{
-      const card=CARDS.find(c=>c.id===cid)||CARDS[0];
-      const x=sx+i*gap, y=636;
-      const obj=makeCard(this,x,y,card);
-      obj.on('pointerover',()=>{
-        obj.y=y-32; obj.setDepth(15);
-        // 有高亮层（完整卡图模式）时显示金色描边
-        const hl=obj.getData('hl');
-        if(hl) hl.setAlpha(1);
-      });
-      obj.on('pointerout',()=>{
-        obj.y=y; obj.setDepth(8);
-        const hl=obj.getData('hl');
-        if(hl) hl.setAlpha(0);
-      });
-      obj.on('pointerdown',()=>{if(!this.busy)this.playCard(i);});
-      this.cards.push(obj);
-    });
-  }
-
-  playCard(idx){
-    const cid=this.hand[idx], card=CARDS.find(c=>c.id===cid)||CARDS[0];
-    if(this.pl.energy<card.cost){floatText(this,640,400,'能量不足！','#ffaa00');return;}
-    this.pl.energy-=card.cost;
-    this.hand.splice(idx,1); this.discard.push(cid);
-
-    // ★★ 根据玩法文档的卡牌效果逐一实现，每种 effect 一个 if/else 分支
-    // 以下是通用基础效果模板，必须按实际卡牌效果扩展/替换：
-    if(card.effect==='damage'){
-      let d=card.value;
-      if(this.en.shield>0){const a=Math.min(this.en.shield,d);this.en.shield-=a;d-=a;}
-      this.en.hp=Math.max(0,this.en.hp-d);
-      floatText(this,1000,260,`-${d}`,'#ff4444');
-      this.tweens.add({targets:this.eSpr,x:1020,duration:55,yoyo:true,repeat:3});
-    } else if(card.effect==='damage2'){
-      // 两次伤害
-      let total=0;
-      for(let t=0;t<2;t++){
-        let d=card.value;
-        if(this.en.shield>0){const a=Math.min(this.en.shield,d);this.en.shield-=a;d-=a;}
-        this.en.hp=Math.max(0,this.en.hp-d); total+=d;
-      }
-      floatText(this,1000,260,`-${total}`,'#ff4444');
-      this.tweens.add({targets:this.eSpr,x:1020,duration:55,yoyo:true,repeat:5});
-    } else if(card.effect==='shield'){
-      this.pl.shield+=card.value; floatText(this,210,280,`+${card.value}护盾`,'#88ccff');
-    } else if(card.effect==='heal'){
-      this.pl.hp=Math.min(this.pl.maxHp,this.pl.hp+card.value);
-      floatText(this,210,280,`+${card.value}HP`,'#44ff88');
-    } else if(card.effect==='draw'){
-      for(let d=0;d<card.value;d++){
-        if(!this.deck.length)this.deck=Phaser.Utils.Array.Shuffle(this.discard.splice(0));
-        if(this.deck.length)this.hand.push(this.deck.pop());
-      }
-      floatText(this,640,400,`摸${card.value}张`,'#aaddff');
-    } else if(card.effect==='weaken'){
-      this.en._weakened=(this.en._weakened||0)+card.value;
-      floatText(this,1000,260,`弱化-${card.value}`,'#ff8833');
-    } else if(card.effect==='stun'){
-      // 跳过对手下一回合行动
-      this.en._stunned=true;
-      floatText(this,1000,260,'眩晕！','#cc44ff');
-    } else if(card.effect==='energy'){
-      // 恢复能量
-      this.pl.energy=Math.min(this.pl.maxEnergy,this.pl.energy+card.value);
-      floatText(this,640,400,`+${card.value}能量`,'#ffdd44');
-    }
-    // ★ 继续按玩法文档添加其他 effect 分支...
-
-    this.updateHUD(); this.renderHand();
-    if(this.en.hp<=0){this.onWin();return;}
-  }
-
-  endTurn(){
-    this.busy=true;
-    this.discard.push(...this.hand); this.hand=[];
-    this.renderHand();
-    this.time.delayedCall(500,()=>{
-      // ★ 检查眩晕等控制效果
-      if(this.en._stunned){
-        this.en._stunned=false;
-        floatText(this,1000,260,'被眩晕，跳过回合','#cc44ff');
-        this.time.delayedCall(700,()=>{this.busy=false;this.startTurn();});
-        return;
-      }
-      let dmg=Math.max(0, this.en.atk-(this.en._weakened||0));
-      this.en._weakened=0;
-      const abs=Math.min(this.pl.shield,dmg); this.pl.shield-=abs; dmg-=abs;
-      this.pl.hp=Math.max(0,this.pl.hp-dmg);
-      if(dmg>0){
-        floatText(this,210,260,`-${dmg}`,'#ff6644');
-        this.tweens.add({targets:this.pSpr,x:190,duration:55,yoyo:true,repeat:3});
-      }
-      this.updateHUD();
-      if(this.pl.hp<=0){this.onLose();return;}
-      this.time.delayedCall(500,()=>{this.busy=false;this.startTurn();});
-    });
-  }
-
-  updateHUD(){
-    this.pHPBar.refresh(this.pl.hp,this.pl.maxHp);
-    this.eHPBar.refresh(this.en.hp,this.en.maxHp);
-    this.shTxt.setText(`护盾: ${this.pl.shield}`);
-    this.enTxt.setText(`能量: ${this.pl.energy}/${this.pl.maxEnergy}`);
-  }
-
-  onWin(){
-    this.busy=true;
-    this.add.rectangle(640,360,1280,720,0x000000,0.78).setDepth(20);
-    this.add.text(640,250,'胜利！',{fontSize:'80px',color:'#ffd700',fontStyle:'bold',stroke:'#000',strokeThickness:10}).setOrigin(0.5).setDepth(25);
-    this.add.text(640,360,`击败了 ${this.en.name}`,{fontSize:'26px',color:'#aaffaa'}).setOrigin(0.5).setDepth(25);
-    this.add.text(640,490,'点击任意处重玩',{fontSize:'20px',color:'#aaa'}).setOrigin(0.5).setDepth(25);
-    this.input.once('pointerdown',()=>this.scene.restart());
-  }
-
-  onLose(){
-    this.busy=true;
-    this.add.rectangle(640,360,1280,720,0x000000,0.82).setDepth(20);
-    this.add.text(640,250,'你倒下了...',{fontSize:'72px',color:'#ff4444',fontStyle:'bold',stroke:'#000',strokeThickness:8}).setOrigin(0.5).setDepth(25);
-    this.add.text(640,360,'再战一局？',{fontSize:'24px',color:'#aaa'}).setOrigin(0.5).setDepth(25);
-    this.add.text(640,490,'点击任意处重新开始',{fontSize:'20px',color:'#888'}).setOrigin(0.5).setDepth(25);
-    this.input.once('pointerdown',()=>this.scene.restart());
-  }
-}
-```
-
-### 游戏入口
-```js
-new Phaser.Game({
-  type: Phaser.WEBGL,
-  width:1280, height:720,
-  backgroundColor:'#0a0a1a',
-  scene:[BootScene, MenuScene, BattleScene],
-  powerPreference:'high-performance',
-});
-```
-
----
-
-## 关键注意
-- `playCard` 的 effect 分支必须覆盖玩法文档中所有 10 张卡的效果，不得遗漏
-- 控制/增益/异变类效果（眩晕、能量增加、摸牌、改变规则等）一律实现，不要省略
-- 背景消除：BootScene.create() 中必须对 PLAYER_IMG 和每个 OPPONENTS[i].img 调用 `removeBackground(this, key)`，BattleScene 中的精灵**不加** blendMode
-- `busy` 标志防止对手回合出牌
-- 牌库耗尽自动将弃牌堆洗入（`Phaser.Utils.Array.Shuffle`）
-- 图片校验：`textures.get(key).source[0].width > 4`"""
-
-# ──────────────────────────────────────────────────────────────────────────────
-# User Prompt 模板
-# ──────────────────────────────────────────────────────────────────────────────
-
-_USER_TEMPLATE = """根据以下 GDD 生成完整的 Roguelike 卡牌原型 HTML 文件。
+_DATA_USER_TEMPLATE = """根据以下 GDD 生成 data.js 文件。
 
 ## 游戏概要
 {summary}
 
-## 玩法设计（核心参考：读取 10 张卡牌的名称/效果/数值，对手设计）
+## ★ 玩法设计文档（卡牌/羁绊/敌人/数值 全部从这里提取）
 {sec_gameplay}
 
-## 世界观（主角/对手命名风格、主题色调、视觉气质）
+## 世界观（命名风格、色调）
 {sec_worldview}
 
-## 已生成美术资源（BootScene.preload() 中全部加载，相对路径）
-格式：key → URL
+## 已生成美术资源（key → URL，用于 ENEMIES/BOSS_DATA 的 img 字段匹配）
 {art_manifest}
 
-## 实现要求
+---
+请输出完整的 data.js 文件内容（纯 JavaScript，无 markdown 包裹）。"""
 
-### 数据层（`<script>` 最顶部定义常量）
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 2 Prompt: effects.js — 效果注册表
+# ──────────────────────────────────────────────────────────────────────────────
+
+_EFFECTS_SYSTEM_PROMPT = """你是资深 H5 游戏工程师，根据玩法文档生成**效果注册表 effects.js**。
+
+## 前置
+data.js 已加载，可直接使用：`CARDS`（10张）、`SYNERGIES`、`ENEMIES`、`BOSS_DATA`，以及 `hasUsableTexture`、`makeFallbackTexture`、`floatText`、`makeHPBar`。不要重复定义。
+
+## 输出规范
+- 只输出纯 JavaScript，无 markdown/HTML
+- 每张卡效果逐一完整实现，禁止 TODO 占位
+
+## 输出内容
+
+### 1. EFFECT_REGISTRY —— 卡牌效果注册表
+
+每张卡以其 `id` 为 key，注册到 `EFFECT_REGISTRY` 对象中。每张卡可以注册以下钩子函数（根据其效果类型选择需要的钩子）：
+
+| 钩子 | 调用时机 | 参数 |
+|------|---------|------|
+| `onActivate(scene, lvlData)` | 首次获得或升级时 | 用于创建持续性效果（如环绕物体） |
+| `onTick(scene, dt, lvlData)` | 每帧 update() 调用 | 用于持续性效果（轨道旋转、DOT 检测） |
+| `onBulletHit(scene, bullet, enemy, lvlData)` | 子弹命中敌人时 | 用于命中触发效果（分裂、腐蚀） |
+| `onEnemyKill(scene, enemy, lvlData)` | 敌人被击杀时 | 用于击杀触发（治疗、爆炸） |
+| `onPlayerDamaged(scene, rawDmg, lvlData)` | 玩家受伤时 | 用于受伤触发（反弹、护盾） |
+| `onPlayerDeath(scene, lvlData)` | 玩家死亡时 | 用于死亡触发（自爆） |
+| `onDash(scene, fromX, fromY, toX, toY, lvlData)` | 闪避/冲刺时 | 用于位移触发（火焰路径） |
+| `onExpPickup(scene, orb, lvlData)` | 拾取经验时 | 用于拾取触发（随机雷击） |
+| `getStatModifiers(lvlData)` | 获取永久属性修改 | 返回 {atkMul, spdMul, rangeMul, sizeMul, maxHpMul} |
+
+示例：
 ```js
-const GAME_TITLE  = "...";             // 从 GDD 取游戏名
-const THEME_COLOR = 0x6633cc;          // 世界观主色（整数十六进制）
-const PLAYER_HP   = 80;               // 主角初始HP
-const MAX_ENERGY  = 3;                // 每回合能量上限
-const PLAYER_IMG  = 'char_protagonist';
-
-// 卡牌池：严格按照玩法文档的 10 张卡牌定义
-// effect 字段命名自由（damage/shield/heal/draw/weaken/stun/energy/...）
-// 按实际效果自由添加 value/times/duration/extra 等所需字段
-const CARDS = [
-  {{ id:'card_id', name:'卡牌名', effect:'xxx', value:N, desc:'效果描述', color:0xRRGGBB }},
-  // ... 共 10 张，一一对应玩法文档，不需要 type 和 cost 字段
-];
-
-// 初始牌组（卡牌 id 数组，可重复，建议 10 张）
-const STARTER_DECK = [...];
-
-// 对手池：从玩法文档提取 2-3 个挑战/对手
-// img 必须与美术资源 key 匹配
-const OPPONENTS = [
-  {{ name:'...', hp:N, atk:N, shield:0, color:0xRRGGBB, img:'char_enemy_xxx' }},
-  // ...
-];
+const EFFECT_REGISTRY = {
+  split_bullet: {
+    onBulletHit(scene, bullet, enemy, lvlData) {
+      const count = lvlData.splitCount || 2;
+      const dmgRatio = lvlData.dmgRatio || 0.4;
+      for (let i = 0; i < count; i++) {
+        const angle = bullet.rotation + (i - (count-1)/2) * 0.5;
+        scene.spawnBullet(enemy.x, enemy.y, angle, bullet.dmg * dmgRatio, true);
+      }
+    }
+  },
+  electric_shield: {
+    onActivate(scene, lvlData) {
+      // 创建/更新环绕电磁球数量
+    },
+    onTick(scene, dt, lvlData) {
+      // 旋转电磁球 + 对接触敌人造成伤害
+    }
+  },
+  // ... 10 张卡全部注册
+};
 ```
 
-### 加载规则（BootScene.preload 中每张图写一行）
-- 背景图：key 与美术资源 key 一致（如 'bg_main', 'bg_menu'）
-- 主角图：key = PLAYER_IMG 的值
-- 对手图：key = OPPONENTS[i].img 的值
-- **完整卡牌图**：每张卡牌一行，key 格式固定为 `'card_' + card.id`（卡牌图尺寸 320×480，已包含边框+插画+文字）
-  ```js
-  this.load.image('card_xxx', '/static/art/SESSION_ID/card_xxx.png');
-  ```
-- 所有路径以 `/static/` 开头
+**每张卡的效果必须逐一完整实现**，不得用通用模板或 TODO 占位。
+钩子函数中通过 `scene.xxx` 访问 GameScene 的属性（如 `scene.player`, `scene.ownedCards`, `scene.enemyGroup` 等）。
+数值从 `lvlData` 参数读取（即 `CARDS[i].levels[lvl-1]`）。
 
-### 渲染规则
-- **角色/对手图**：在 BootScene.create() 中调用 `removeBackground(this, key)` 消除白底/棋盘格灰底；BattleScene 中直接 `add.image(...).setDisplaySize(160, 160)` 即可，**不加任何 blendMode**
-- **卡牌完整图**（有自己的背景色）：直接 `setDisplaySize(145, 217)` 展示，**不调用 removeBackground**
-- **背景图**：直接展示，不做处理
-- 图片加载校验：`textures.get(key).source[0].width > 4`
+### 2. SYNERGY_REGISTRY —— 羁绊效果注册表
 
-### 效果实现规则（最重要）
-- `playCard` 函数须按玩法文档为每张卡的 effect 写专属实现
-- 通用基础效果（damage/shield/heal/draw/weaken）已在模板提供
-- **其他主题化效果必须完整实现**：跳过对手回合（stun）、恢复能量、改变最大能量、造成多段伤害、永久增益、改变摸牌数等
-- 控制类效果（stun/freeze）：设置 `this.en._stunned=true`，endTurn 中检查跳过
-- 持续增益：在 `startTurn` 开头处理计数器减少
-- 特殊/异变类：大胆实现，用飘字提示效果（floatText）
-"""
+```js
+const SYNERGY_REGISTRY = {
+  synergy_id: {
+    onActivate(scene) {
+      // 羁绊首次激活时的效果
+    },
+    onTick(scene, dt) {
+      // 羁绊持续效果（可选）
+    }
+  },
+  // ... 每个羁绊
+};
+```
+
+### 3. 辅助分发函数
+
+```js
+function dispatchEffect(hookName, scene, ...args) {
+  for (const [cardId, lvl] of scene.ownedCards) {
+    const reg = EFFECT_REGISTRY[cardId];
+    if (reg && reg[hookName]) {
+      const card = CARDS.find(c => c.id === cardId);
+      const lvlData = card ? card.levels[Math.min(lvl, card.levels.length) - 1] : {};
+      reg[hookName](scene, ...args, lvlData);
+    }
+  }
+}
+
+function dispatchSynergyTick(scene, dt) {
+  for (const syn of scene.activeSynergies || []) {
+    const reg = SYNERGY_REGISTRY[syn.id];
+    if (reg && reg.onTick) reg.onTick(scene, dt);
+  }
+}
+```
+
+## 禁止
+只输出 effects.js：EFFECT_REGISTRY、SYNERGY_REGISTRY、dispatchEffect、dispatchSynergyTick。不输出 Scene、CARDS/ENEMIES、config、HTML/markdown。"""
+
+
+_EFFECTS_USER_TEMPLATE = """根据以下 GDD 生成 effects.js 文件（效果注册表）。
+
+## 游戏概要
+{summary}
+
+## ★ 玩法设计文档（每张卡的效果从这里提取）
+{sec_gameplay}
+
+## data.js 导出的函数签名（调用时必须严格匹配参数顺序和个数）
+{data_js_signatures}
+
+## data.js 内容（已加载，可直接使用其中的变量和函数）
+```javascript
+{data_js}
+```
+
+---
+请输出完整的 effects.js 文件内容（纯 JavaScript，无 markdown 包裹）。
+必须包含 EFFECT_REGISTRY（10张卡）、SYNERGY_REGISTRY（所有羁绊）、dispatchEffect、dispatchSynergyTick。"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 3 Prompt: scenes.js — 场景层（核心骨架）
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SCENES_SYSTEM_PROMPT = """你是资深 H5 游戏工程师，根据玩法文档生成**场景层 scenes.js**。
+
+## 前置
+data.js 提供：GAME_TITLE、THEME_COLOR、PLAYER_HP、PLAYER_IMG、CARDS、SYNERGIES、ENEMIES、BOSS_DATA，以及 hasUsableTexture、makeFallbackTexture(scene,key,color,w,h)、removeBackground、makeCard、floatText、makeHPBar。
+effects.js 提供：EFFECT_REGISTRY、SYNERGY_REGISTRY、dispatchEffect、dispatchSynergyTick。不要重复定义。
+
+## 关键约定（易错点）
+1. **卡牌效果**：update 中写 `dispatchEffect('onTick', this, dt)`，禁止自创 `updateCardEffects` 等
+2. **键盘**：addKeys 的 key 是 left/right/up/down/arrowLeft，update 中用 `this.keys.left` 而非 `keys.A`；用方向键需先 `createCursorKeys()` 得到 `this.cursors`
+3. **makeFallbackTexture**：参数顺序 (scene, key, color, w, h)，第3个是 color
+
+## 输出规范
+- 纯 JavaScript，无 markdown/HTML
+- 分辨率 1920×1080，场景名 'Boot'、'Menu'、'Game'
+- 优先保证完整，GameScene 必须包含 create、update、takeDamage、updateHUD、showGameOver、showVictory
+
+## 效果分发规则（最重要！）
+
+GameScene 中**不要硬编码任何卡牌特定逻辑**。在以下时机调用 dispatchEffect：
+
+```js
+// 子弹命中敌人时
+onBulletHitEnemy(bullet, enemy) {
+  this.damageEnemy(enemy, bullet.dmg);
+  dispatchEffect('onBulletHit', this, bullet, enemy);
+}
+
+// update() 每帧
+update(time, delta) {
+  const dt = delta / 1000;
+  if (this.isChoosingCard) {
+    // 选卡期间暂停战斗逻辑，玩家不会受到攻击
+    return;
+  }
+  // ... 移动、碰撞等通用逻辑 ...
+  dispatchEffect('onTick', this, dt);
+  dispatchSynergyTick(this, dt);
+}
+
+// 敌人被击杀时
+onEnemyDeath(enemy) {
+  // ... 经验掉落等 ...
+  dispatchEffect('onEnemyKill', this, enemy);
+}
+
+// 玩家受伤时
+takeDamage(rawDmg) {
+  if (this.isChoosingCard) {
+    // 选卡期间不结算伤害
+    return;
+  }
+  // ... 扣血逻辑 ...
+  dispatchEffect('onPlayerDamaged', this, rawDmg);
+}
+
+// 闪避/冲刺时
+performDash() {
+  // ... 位移逻辑 ...
+  dispatchEffect('onDash', this, fromX, fromY, toX, toY);
+}
+
+// 拾取经验时
+onPickupExp(player, orb) {
+  // ... 经验累加 ...
+  dispatchEffect('onExpPickup', this, orb);
+}
+
+// 玩家死亡时
+onPlayerDeath() {
+  dispatchEffect('onPlayerDeath', this);
+  // ... 结算画面 ...
+}
+
+// 获得/升级卡牌后
+onCardObtained(cardId, newLvl) {
+  const card = CARDS.find(c => c.id === cardId);
+  const lvlData = card.levels[newLvl - 1];
+  const reg = EFFECT_REGISTRY[cardId];
+  if (reg && reg.onActivate) reg.onActivate(this, lvlData);
+  // 应用属性修改器
+  if (reg && reg.getStatModifiers) {
+    const mods = reg.getStatModifiers(lvlData);
+    // 更新玩家属性...
+  }
+  this.checkSynergies();
+}
+```
+
+## 你必须输出的内容
+
+### BootScene
+- `preload()`：加载进度条 + 逐行加载所有美术资源
+- `create()`：
+  - 调用 `makeFallbackTexture(this, key, color, w, h)` 为加载失败的纹理创建占位 ← **第3参数是颜色，不是宽度！**
+  - 调用 `removeBackground(this, key)` 清除角色/敌人背景
+  - 然后 `this.scene.start('Menu')`
+
+### MenuScene
+- 背景图 + 游戏标题 + 副标题 + 开始按钮
+- **界面须优美**：按钮用 setStrokeStyle 描边、圆角矩形或 setScale  hover 动效，标题用 stroke/strokeThickness 增加层次感，避免纯色方块
+
+### GameScene
+先判断游戏类型（实时动作/回合制/跑酷），然后实现：
+
+1. `create()` —— 初始化玩家、敌人组、子弹组、键盘输入、HUD
+   - **玩家精灵**：`this.player.setDisplaySize(136, 136)` 或 128~144 范围（PC 端占比约 12~13%）
+   - **敌人**：使用 data.js 中 ENEMIES 的 size 字段做 setDisplaySize，若 data 未定义则用 112
+   - **Boss**：使用 BOSS_DATA 的 size 做 setDisplaySize，建议 200~260
+   - **背景虚化**：背景 tileSprite（this.bg）创建后调用 `this.bg.postFX.addBlur(6)` 虚化背景，突出主角和怪物
+   - `this.ownedCards = new Map()` —— 持有卡牌（cardId → level）
+   - `this.activeSynergies = []` —— 已激活羁绊列表
+2. `update(time, delta)` —— 帧循环（移动 + 碰撞 + dispatchEffect('onTick')）
+3. 玩家移动（WASD / 方向键）
+4. 玩家射击 / 自动攻击
+5. `spawnBullet(x, y, angle, dmg, isSplit)` —— 供 effects.js 中的分裂效果调用
+6. 碰撞回调 → dispatchEffect 分发
+7. 敌人 AI + 波次刷新 + Boss 登场
+8. 经验 / 升级系统 → 触发选卡弹窗
+9. 选卡弹窗（3选1）：**选卡期间游戏必须暂停**（update 不执行敌人移动/碰撞/伤害，玩家不受攻击），弹窗出现时设 `this.isChoosingCard = true`，选完再恢复。卡牌**只展示图片**（调用 makeCard 即可），不叠加 card.name、desc、Lv 等文字；每张 400×600 或以上，选卡区域约占屏幕 50%；pointerover 时 setScale(1.05) 作为点击反馈
+10. 羁绊检测：`checkSynergies()` → 更新 `this.activeSynergies`
+11. HUD：血条/经验条用圆角或渐变填充，与主题色协调
+12. 胜/负判定 + 一键重玩：结算界面有遮罩、标题描边、按钮 hover 反馈
+
+## UI 与比例
+按钮/选卡：圆角、描边、hover 时 setScale(1.05)。弹窗：半透明遮罩、居中。主角 128~144px，敌人 100~128px，Boss 200~260px。**选卡 UI**：卡牌为游戏核心，每张卡 400×600 以上，选卡区域占屏幕约 50%；选卡时游戏暂停（isChoosingCard 为 true 时 update 跳过战斗逻辑）。
+
+## 禁止
+只输出 BootScene/MenuScene/GameScene 三个类。不输出 CARDS/SYNERGIES/ENEMIES、EFFECT_REGISTRY/SYNERGY_REGISTRY、工具函数、new Phaser.Game、HTML/markdown。"""
+
+
+_SCENES_USER_TEMPLATE = """根据以下 GDD 生成 scenes.js 文件。
+
+## 游戏概要
+{summary}
+
+## ★ 玩法设计文档（核心循环和操控方式由此决定）
+{sec_gameplay}
+
+## 世界观
+{sec_worldview}
+
+## 美术资源清单（BootScene.preload() 中逐行加载）
+{art_manifest}
+
+## data.js 导出的函数签名（调用时必须严格匹配参数顺序和个数）
+{data_js_signatures}
+
+## data.js 内容（已加载，可直接使用）
+```javascript
+{data_js}
+```
+
+## effects.js 内容（已加载，通过 dispatchEffect 调用）
+```javascript
+{effects_js}
+```
+
+---
+请输出完整的 scenes.js 文件内容（纯 JavaScript，无 markdown 包裹）。
+包含 BootScene、MenuScene、GameScene 三个类。
+不要包含 `new Phaser.Game(config)`。"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 续写 Prompt（scenes.js 截断后自动续写）
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SCENES_CONTINUE_SYSTEM = """你是资深 H5 游戏工程师。scenes.js 在生成过程中被截断了，你的任务是**从断点处继续写完剩余代码**。
+
+## 铁律
+1. **只输出续写部分的纯 JavaScript 代码**，不加任何 markdown 标记
+2. 从提供的代码尾部之后继续
+3. 如果最后一行是不完整的语句，先补全该语句
+4. 确保所有 class 和函数的大括号正确闭合
+5. **不要重复**已有的类定义和方法
+6. 不要输出 `new Phaser.Game(config)`
+
+## 前置条件（全局可用，不要重新定义）
+- data.js: GAME_TITLE, THEME_COLOR, PLAYER_HP, CARDS, SYNERGIES, ENEMIES, BOSS_DATA, makeFallbackTexture, floatText, makeHPBar 等
+- effects.js: EFFECT_REGISTRY, SYNERGY_REGISTRY, dispatchEffect, dispatchSynergyTick"""
+
+_SCENES_CONTINUE_USER = """scenes.js 生成到一半被截断了。以下是已生成代码的**尾部（最后 150 行）**，请从断点处继续写完。
+
+## 已生成代码尾部
+```javascript
+{tail_code}
+```
+
+## 截断诊断
+{missing_info}
+
+## 要求
+1. **只输出续写部分**，不要重复上面已有的代码
+2. 确保 GameScene 类中包含完整的 update()、updateHUD()、takeDamage()、showGameOver()、showVictory() 方法
+3. 确保所有 class 的大括号正确闭合
+4. 不要输出 markdown 标记"""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -553,10 +551,7 @@ def _clean_art_key(raw: str) -> str:
 
 
 def _build_art_manifest(state: GameDesignState) -> str:
-    """
-    构建美术资源清单，供 LLM 在 preload() 中加载。
-    格式：  key → /static/art/{sid}/{filename}.ext
-    """
+    """构建美术资源清单，格式：key → /static/art/{sid}/{filename}.ext"""
     art_assets: dict = state.get("art_assets") or {}
     art_samples: dict = state.get("art_samples") or {}
     all_art = {**art_samples, **art_assets}
@@ -578,29 +573,175 @@ def _build_art_manifest(state: GameDesignState) -> str:
     return "\n".join(lines) if lines else "（美术资源清单为空，请用程序化图形占位）"
 
 
-def _extract_html(text: str) -> str:
-    """从 LLM 输出中提取 HTML（兼容带 markdown 代码块的情况）。"""
-    pattern = r"```(?:html)?\s*([\s\S]+?)```"
-    m = re.search(pattern, text)
-    if m:
-        return m.group(1).strip()
+def _extract_js(text: str) -> str:
+    """从 LLM 输出中提取 JS（兼容带 markdown 代码块的情况）。"""
+    for pattern in [r"```(?:javascript|js)\s*([\s\S]+?)```", r"```\s*([\s\S]+?)```"]:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
     return text.strip()
 
 
+def _extract_function_signatures(js_code: str) -> str:
+    """从 JS 代码中提取所有顶层 function 签名，返回接口契约文本。"""
+    pattern = r"^function\s+(\w+)\s*\(([^)]*)\)"
+    sigs: list[str] = []
+    for m in re.finditer(pattern, js_code, re.MULTILINE):
+        name, params = m.group(1), m.group(2).strip()
+        sigs.append(f"  function {name}({params})")
+    return "\n".join(sigs) if sigs else "(未检测到函数签名)"
+
+
+def _validate_cross_file_calls(
+    data_js: str, effects_js: str, scenes_js: str,
+) -> list[str]:
+    """校验 effects.js/scenes.js 对 data.js 函数的调用参数个数是否匹配。"""
+    def_pattern = r"^function\s+(\w+)\s*\(([^)]*)\)"
+    definitions: dict[str, int] = {}
+    for m in re.finditer(def_pattern, data_js, re.MULTILINE):
+        name = m.group(1)
+        params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+        definitions[name] = len(params)
+
+    warnings: list[str] = []
+    for fname, code in [("effects.js", effects_js), ("scenes.js", scenes_js)]:
+        for func_name, expected_count in definitions.items():
+            call_pattern = rf"(?<!\w){func_name}\s*\(([^)]*)\)"
+            for cm in re.finditer(call_pattern, code):
+                raw_args = cm.group(1).strip()
+                if not raw_args:
+                    arg_count = 0
+                else:
+                    depth = 0
+                    arg_count = 1
+                    for ch in raw_args:
+                        if ch in "([{":
+                            depth += 1
+                        elif ch in ")]}":
+                            depth -= 1
+                        elif ch == "," and depth == 0:
+                            arg_count += 1
+                if arg_count != expected_count:
+                    warnings.append(
+                        f"{fname}: {func_name}() 期望 {expected_count} 个参数，"
+                        f"实际传了 {arg_count} 个"
+                    )
+    return warnings
+
+
+def _is_scenes_js_complete(js_code: str) -> tuple[bool, str]:
+    """检查 scenes.js 是否完整。返回 (is_complete, missing_description)。"""
+    if not js_code.strip():
+        return False, "文件为空"
+
+    missing: list[str] = []
+
+    if "class BootScene" not in js_code:
+        missing.append("缺少 BootScene 类")
+    if "class MenuScene" not in js_code:
+        missing.append("缺少 MenuScene 类")
+    if "class GameScene" not in js_code:
+        missing.append("缺少 GameScene 类")
+
+    open_b = js_code.count("{")
+    close_b = js_code.count("}")
+    if open_b > close_b + 1:
+        missing.append(f"大括号未闭合（'{{' 多 {open_b - close_b} 个）")
+
+    if "class GameScene" in js_code:
+        game_section = js_code[js_code.index("class GameScene"):]
+        for method in ["update(", "takeDamage", "showGameOver", "showVictory"]:
+            if method not in game_section:
+                missing.append(f"GameScene 缺少 {method.rstrip('(')}()")
+
+    if missing:
+        return False, "；".join(missing)
+    return True, ""
+
+
+def assemble_full_html(game_title: str, data_js: str, effects_js: str, scenes_js: str, main_js: str) -> str:
+    """将所有 JS 内联拼成完整 HTML（用于 game_code 字段向后兼容）。"""
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>{game_title}</title>
+<style>* {{ margin:0; padding:0; }} body {{ background:#000; overflow:hidden; display:flex; justify-content:center; align-items:center; height:100vh; }}</style>
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.88.2/dist/phaser.min.js"></script>
+</head>
+<body>
+<script>
+// ═══ DATA LAYER ═══
+{data_js}
+</script>
+<script>
+// ═══ EFFECTS REGISTRY ═══
+{effects_js}
+</script>
+<script>
+// ═══ SCENES ═══
+{scenes_js}
+</script>
+<script>
+// ═══ GAME INIT ═══
+{main_js}
+</script>
+</body>
+</html>"""
+
+
+def _get_code_llm():
+    """创建代码生成用的 LLM 实例。"""
+    code_model = settings.CODE_MODEL
+    extra_kwargs: dict = {}
+    if code_model.startswith("anthropic/"):
+        extra_kwargs["max_tokens"] = 200000
+
+    extra_headers = {}
+    if settings.is_openrouter:
+        if settings.OR_SITE_URL:
+            extra_headers["HTTP-Referer"] = settings.OR_SITE_URL
+        if settings.OR_SITE_NAME:
+            extra_headers["X-Title"] = settings.OR_SITE_NAME
+
+    return ChatOpenAI(
+        model=code_model,
+        api_key=settings.OPENAI_API_KEY,
+        base_url=settings.OPENAI_BASE_URL,
+        streaming=True,
+        temperature=0.1,
+        request_timeout=600,
+        max_retries=1,
+        default_headers=extra_headers or None,
+        **extra_kwargs,
+    ), code_model
+
+
+async def _stream_llm(llm, messages) -> AsyncGenerator[tuple[str, str], None]:
+    """流式调用 LLM，yield (event_type, content) 元组。"""
+    async for chunk in llm.astream(messages):
+        raw = chunk.content
+        if isinstance(raw, list):
+            token = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in raw
+            )
+        else:
+            token = raw or ""
+        if token:
+            yield ("token", token)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# 主函数（SSE 流式调用）
+# 主函数（3 步 LLM 生成 SSE 流）
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def generate_game_code_stream(
     state: GameDesignState,
 ) -> AsyncGenerator[dict, None]:
     """
-    流式生成 H5 游戏代码，yield 进度事件。
-    事件格式：
-      {"type": "token",    "text": "..."}
-      {"type": "progress", "message": "..."}
-      {"type": "done",     "game_code": "<!DOCTYPE html>..."}
-      {"type": "error",    "message": "..."}
+    分三步生成游戏代码（data.js + effects.js + scenes.js），yield SSE 事件。
     """
     sec_gameplay  = (state.get("sec_gameplay")  or "").strip()
     sec_worldview = (state.get("sec_worldview") or "").strip()
@@ -615,44 +756,207 @@ async def generate_game_code_stream(
     summary      = _build_summary(state)
     art_manifest = _build_art_manifest(state)
 
-    yield {"type": "progress", "message": "正在分析设计文档，规划游戏架构..."}
+    llm, code_model = _get_code_llm()
+    logger.info("代码生成使用模型：%s", code_model)
 
-    llm = ChatOpenAI(
-        model=settings.CODE_MODEL,
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL,
-        streaming=True,
-        temperature=0.2,
-    )
+    # ── Step 1: 生成 data.js ────────────────────────────────────────
+    yield {"type": "progress", "message": f"[1/3] 正在生成数据层 (data.js)，模型: {code_model}..."}
 
-    messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user",   "content": _USER_TEMPLATE.format(
+    data_messages = [
+        {"role": "system", "content": _DATA_SYSTEM_PROMPT},
+        {"role": "user",   "content": _DATA_USER_TEMPLATE.format(
             summary       = summary,
-            sec_gameplay  = sec_gameplay[:5000]  or "（暂无）",
-            sec_worldview = sec_worldview[:2000] or "（暂无）",
+            sec_gameplay  = sec_gameplay[:8000]  or "（暂无）",
+            sec_worldview = sec_worldview[:3000] or "（暂无）",
             art_manifest  = art_manifest,
         )},
     ]
 
-    yield {"type": "progress", "message": "LLM 开始生成 Phaser.js 代码..."}
+    data_js_text = ""
+    data_token_count = 0
+    try:
+        async for _, content in _stream_llm(llm, data_messages):
+            data_js_text += content
+            data_token_count += len(content)
+            yield {"type": "token", "text": content}
+            if data_token_count % 300 < len(content):
+                yield {"type": "progress", "message": f"[1/3] data.js 生成中... {data_token_count} 字符"}
+    except Exception as exc:
+        logger.exception("data.js 生成失败：%s", exc)
+        yield {"type": "error", "message": f"data.js 生成失败：{exc}"}
+        return
 
-    full_text = ""
-    async for chunk in llm.astream(messages):
-        raw = chunk.content
-        # 部分模型（如 gpt-5.3-codex）返回内容块列表而非纯字符串
-        if isinstance(raw, list):
-            token = "".join(
-                part.get("text", "") if isinstance(part, dict) else str(part)
-                for part in raw
-            )
+    data_js = _extract_js(data_js_text)
+    if not data_js.strip():
+        yield {"type": "error", "message": "data.js 生成为空，请重试"}
+        return
+
+    logger.info("data.js 生成完毕：%d 字符", len(data_js))
+
+    data_js_signatures = _extract_function_signatures(data_js)
+    logger.info("data.js 接口契约：\n%s", data_js_signatures)
+    yield {"type": "progress", "message": f"[1/3] data.js 完成（{len(data_js)} 字符）"}
+
+    # ── Step 2: 生成 effects.js ─────────────────────────────────────
+    yield {"type": "progress", "message": f"[2/3] 正在生成效果注册表 (effects.js)，模型: {code_model}..."}
+
+    effects_messages = [
+        {"role": "system", "content": _EFFECTS_SYSTEM_PROMPT},
+        {"role": "user",   "content": _EFFECTS_USER_TEMPLATE.format(
+            summary            = summary,
+            sec_gameplay       = sec_gameplay[:8000]  or "（暂无）",
+            data_js            = data_js[:12000],
+            data_js_signatures = data_js_signatures,
+        )},
+    ]
+
+    effects_js_text = ""
+    effects_token_count = 0
+    try:
+        async for _, content in _stream_llm(llm, effects_messages):
+            effects_js_text += content
+            effects_token_count += len(content)
+            yield {"type": "token", "text": content}
+            if effects_token_count % 300 < len(content):
+                yield {"type": "progress", "message": f"[2/3] effects.js 生成中... {effects_token_count} 字符"}
+    except Exception as exc:
+        logger.exception("effects.js 生成失败：%s", exc)
+        yield {"type": "error", "message": f"effects.js 生成失败：{exc}"}
+        return
+
+    effects_js = _extract_js(effects_js_text)
+    if not effects_js.strip():
+        yield {"type": "error", "message": "effects.js 生成为空，请重试"}
+        return
+
+    logger.info("effects.js 生成完毕：%d 字符", len(effects_js))
+    yield {"type": "progress", "message": f"[2/3] effects.js 完成（{len(effects_js)} 字符）"}
+
+    # ── Step 3: 生成 scenes.js ──────────────────────────────────────
+    yield {"type": "progress", "message": f"[3/3] 正在生成场景层 (scenes.js)，模型: {code_model}..."}
+
+    scenes_messages = [
+        {"role": "system", "content": _SCENES_SYSTEM_PROMPT},
+        {"role": "user",   "content": _SCENES_USER_TEMPLATE.format(
+            summary            = summary,
+            sec_gameplay       = sec_gameplay[:6000]  or "（暂无）",
+            sec_worldview      = sec_worldview[:2000] or "（暂无）",
+            art_manifest       = art_manifest,
+            data_js            = data_js[:10000],
+            data_js_signatures = data_js_signatures,
+            effects_js         = effects_js[:10000],
+        )},
+    ]
+
+    scenes_js_text = ""
+    scenes_token_count = 0
+    try:
+        async for _, content in _stream_llm(llm, scenes_messages):
+            scenes_js_text += content
+            scenes_token_count += len(content)
+            yield {"type": "token", "text": content}
+            if scenes_token_count % 300 < len(content):
+                yield {"type": "progress", "message": f"[3/3] scenes.js 生成中... {scenes_token_count} 字符"}
+    except Exception as exc:
+        logger.exception("scenes.js 生成失败：%s", exc)
+        yield {"type": "error", "message": f"scenes.js 生成失败：{exc}"}
+        return
+
+    scenes_js = _extract_js(scenes_js_text)
+    if not scenes_js.strip():
+        yield {"type": "error", "message": "scenes.js 生成为空，请重试"}
+        return
+
+    logger.info("scenes.js 初次生成：%d 字符", len(scenes_js))
+
+    # ── Step 3.5: 截断检测 + 自动续写 ──────────────────────────────
+    MAX_CONTINUATIONS = 2
+    for cont_round in range(MAX_CONTINUATIONS):
+        is_complete, missing_info = _is_scenes_js_complete(scenes_js)
+        if is_complete:
+            logger.info("scenes.js 完整性校验通过")
+            break
+
+        logger.warning("scenes.js 截断检测（第 %d 轮）：%s", cont_round + 1, missing_info)
+        yield {
+            "type": "progress",
+            "message": f"⚠ scenes.js 不完整（{missing_info}），自动续写第 {cont_round + 1} 轮...",
+        }
+
+        tail_lines = scenes_js.strip().splitlines()[-150:]
+        tail_code = "\n".join(tail_lines)
+
+        cont_messages = [
+            {"role": "system", "content": _SCENES_CONTINUE_SYSTEM},
+            {"role": "user",   "content": _SCENES_CONTINUE_USER.format(
+                tail_code=tail_code,
+                missing_info=missing_info,
+            )},
+        ]
+
+        cont_text = ""
+        cont_chars = 0
+        try:
+            async for _, content in _stream_llm(llm, cont_messages):
+                cont_text += content
+                cont_chars += len(content)
+                yield {"type": "token", "text": content}
+                if cont_chars % 300 < len(content):
+                    yield {"type": "progress", "message": f"[续写 {cont_round + 1}] {cont_chars} 字符..."}
+        except Exception as exc:
+            logger.exception("scenes.js 续写失败：%s", exc)
+            yield {"type": "progress", "message": f"⚠ 续写失败（{exc}），使用已有代码继续"}
+            break
+
+        cont_js = _extract_js(cont_text)
+        if cont_js.strip():
+            scenes_js = scenes_js.rstrip() + "\n\n" + cont_js.strip()
+            logger.info("scenes.js 续写后：%d 字符（+%d）", len(scenes_js), len(cont_js))
+            yield {"type": "progress", "message": f"[续写 {cont_round + 1}] 拼接完成（+{len(cont_js)} 字符，总 {len(scenes_js)} 字符）"}
         else:
-            token = raw or ""
-        if token:
-            full_text += token
-            yield {"type": "token", "text": token}
+            logger.warning("续写输出为空，跳过")
+            break
+    else:
+        final_complete, final_missing = _is_scenes_js_complete(scenes_js)
+        if not final_complete:
+            logger.warning("scenes.js 经过 %d 轮续写仍不完整：%s", MAX_CONTINUATIONS, final_missing)
+            yield {"type": "progress", "message": f"⚠ scenes.js 经过 {MAX_CONTINUATIONS} 轮续写仍不完整（{final_missing}），将由 reviewer 补全"}
 
-    game_code = _extract_html(full_text)
+    logger.info("scenes.js 最终长度：%d 字符", len(scenes_js))
 
-    yield {"type": "progress", "message": "代码生成完毕，正在处理..."}
-    yield {"type": "done", "game_code": game_code}
+    # ── 跨文件接口校验 ─────────────────────────────────────────────
+    api_warnings = _validate_cross_file_calls(data_js, effects_js, scenes_js)
+    if api_warnings:
+        for w in api_warnings:
+            logger.warning("跨文件接口不匹配：%s", w)
+        warn_text = "；".join(api_warnings[:5])
+        yield {"type": "progress", "message": f"⚠ 接口校验发现 {len(api_warnings)} 处参数不匹配：{warn_text}"}
+    else:
+        logger.info("跨文件接口校验通过")
+
+    # ── Step 4: 模板组装 ────────────────────────────────────────────
+    sr = state.get("structured_req") or {}
+    game_title = sr.get("title") or sr.get("theme") or "Roguelike Game"
+
+    index_html = _INDEX_HTML_TEMPLATE.format(game_title=game_title)
+    style_css  = _STYLE_CSS
+    main_js    = _MAIN_JS_TEMPLATE.format()
+
+    assembled_html = assemble_full_html(game_title, data_js, effects_js, scenes_js, main_js)
+
+    files = {
+        "index.html":  index_html,
+        "style.css":   style_css,
+        "data.js":     data_js,
+        "effects.js":  effects_js,
+        "scenes.js":   scenes_js,
+        "main.js":     main_js,
+    }
+
+    total_js = len(data_js) + len(effects_js) + len(scenes_js) + len(main_js)
+    yield {"type": "progress", "message": f"代码生成完毕（data: {len(data_js)} + effects: {len(effects_js)} + scenes: {len(scenes_js)} = {total_js} 字符）"}
+    yield {
+        "type": "done",
+        "game_code": assembled_html,
+        "files": files,
+    }

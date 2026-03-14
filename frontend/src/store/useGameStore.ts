@@ -130,6 +130,19 @@ interface GameStore {
   setReviewSummary: (s: string) => void
   reviewChangedLines: number
   setReviewChangedLines: (n: number) => void
+
+  // 代码实时修改
+  modifyInProgress: boolean
+  setModifyInProgress: (v: boolean) => void
+  modifyAnalysis: string
+  setModifyAnalysis: (s: string) => void
+  modifyResults: Array<{ index: number; file: string; ok: boolean; reason: string }>
+  addModifyResult: (r: { index: number; file: string; ok: boolean; reason: string }) => void
+  modifyChangedFiles: string[]
+  setModifyChangedFiles: (f: string[]) => void
+  modifyHistory: Array<{ instruction: string; changedFiles: string[]; timestamp: number }>
+  addModifyHistory: (h: { instruction: string; changedFiles: string[] }) => void
+  resetModify: () => void
 }
 
 export const useGameStore = create<GameStore>((set, get) => ({
@@ -216,6 +229,11 @@ export const useGameStore = create<GameStore>((set, get) => ({
       reviewDiff:          [],
       reviewSummary:       '',
       reviewChangedLines:  0,
+      modifyInProgress:    false,
+      modifyAnalysis:      '',
+      modifyResults:       [],
+      modifyChangedFiles:  [],
+      modifyHistory:       [],
       // sessionList 不清空，保留历史记录
     }),
 
@@ -262,4 +280,23 @@ export const useGameStore = create<GameStore>((set, get) => ({
   setReviewSummary: (s) => set({ reviewSummary: s }),
   reviewChangedLines: 0,
   setReviewChangedLines: (n) => set({ reviewChangedLines: n }),
+
+  modifyInProgress: false,
+  setModifyInProgress: (v) => set({ modifyInProgress: v }),
+  modifyAnalysis: '',
+  setModifyAnalysis: (s) => set({ modifyAnalysis: s }),
+  modifyResults: [],
+  addModifyResult: (r) => set((s) => ({ modifyResults: [...s.modifyResults, r] })),
+  modifyChangedFiles: [],
+  setModifyChangedFiles: (f) => set({ modifyChangedFiles: f }),
+  modifyHistory: [],
+  addModifyHistory: (h) => set((s) => ({
+    modifyHistory: [...s.modifyHistory, { ...h, timestamp: Date.now() }],
+  })),
+  resetModify: () => set({
+    modifyInProgress: false,
+    modifyAnalysis: '',
+    modifyResults: [],
+    modifyChangedFiles: [],
+  }),
 }))

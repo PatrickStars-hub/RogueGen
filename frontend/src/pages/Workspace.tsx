@@ -8,6 +8,52 @@ import type { DiffHunk, ReviewIssue, ReviewFix } from '../store/useGameStore'
 import type { AgentName, DocSections } from '../types'
 
 // ──────────────────────────────────────────────────────────────────────────────
+// 图片预览弹层
+// ──────────────────────────────────────────────────────────────────────────────
+function ImagePreviewModal({ src, alt, onClose }: { src: string; alt: string; onClose: () => void }) {
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [onClose])
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm cursor-zoom-out"
+      onClick={onClose}
+    >
+      <div className="relative max-w-[90vw] max-h-[90vh]" onClick={(e) => e.stopPropagation()}>
+        <img src={src} alt={alt} className="max-w-full max-h-[85vh] object-contain rounded-lg shadow-2xl" />
+        <div className="mt-2 text-center">
+          <span className="font-mono text-xs text-gray-400 bg-gray-900/80 px-3 py-1 rounded">{alt}</span>
+        </div>
+        <button
+          onClick={onClose}
+          className="absolute -top-3 -right-3 w-8 h-8 rounded-full bg-gray-800 border border-gray-600 text-gray-300 hover:text-white hover:bg-gray-700 flex items-center justify-center text-sm transition-all"
+        >
+          ✕
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function ClickableArtImage({ src, alt, className }: { src: string; alt: string; className?: string }) {
+  const [preview, setPreview] = useState<{ src: string; alt: string } | null>(null)
+  return (
+    <>
+      <img
+        src={src}
+        alt={alt}
+        className={`${className || ''} cursor-zoom-in`}
+        onClick={() => setPreview({ src, alt })}
+      />
+      {preview && <ImagePreviewModal src={preview.src} alt={preview.alt} onClose={() => setPreview(null)} />}
+    </>
+  )
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // 时间线消息重建（localStorage 无记录时的兜底）
 // ──────────────────────────────────────────────────────────────────────────────
 function _buildTimelineMessages(
@@ -81,7 +127,8 @@ function PipelinePanel({
   onViewStep: (id: number | null) => void
 }) {
   const { codeGenDone, artGenDone, artGenItems, artGenTotal,
-          reviewInProgress, reviewDone, reviewIssues, reviewChangedLines } = useGameStore()
+          reviewInProgress, reviewDone, reviewIssues, reviewChangedLines,
+          artSamples } = useGameStore()
   return (
     <div className="flex flex-col gap-1 py-6 px-3">
       <div className="text-xs font-mono text-gray-600 tracking-widest mb-4 px-2">▸ 开发流水线</div>
@@ -89,8 +136,8 @@ function PipelinePanel({
         const done    = s.id < step
         const active  = s.id === step
         const viewing = viewStep !== null && viewStep === s.id && !active
-        // 已完成步骤 (done) 可以点击查看
-        const clickable = done && s.id >= 1
+        // 已完成步骤（步骤1-5）可点击查看历史产出
+        const clickable = done && s.id >= 1 && s.id <= 5
 
         return (
           <div key={s.id}>
@@ -123,7 +170,13 @@ function PipelinePanel({
                   done     ? 'text-green-500' : 'text-gray-600'
                 }`}>{s.label}</div>
                 <div className="font-mono text-[10px] text-gray-700">
-                  {viewing ? '👁 查看产出' : done && clickable ? '点击查看产出' : s.desc}
+                  {viewing ? '👁 查看产出' :
+                   done && clickable ? (
+                     s.id === 3 ? `${Object.keys(artSamples).length} 张样图 · 点击查看` :
+                     s.id === 4 ? `${artGenItems.filter(i=>!i.error).length} 张美术 · 点击查看` :
+                     s.id === 5 ? `${reviewIssues.length} 个问题 · 点击查看` :
+                     '点击查看产出'
+                   ) : s.desc}
                 </div>
               </div>
               {active && (
@@ -727,8 +780,8 @@ function BuildDashboard({ sessionId, onDone }: { sessionId: string; onDone: () =
                   </div>
                 ) : item.url_path ? (
                   <>
-                    <img src={item.url_path} alt={item.filename} className="w-full h-full object-cover" />
-                    <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-1">
+                    <ClickableArtImage src={item.url_path} alt={item.filename} className="w-full h-full object-cover" />
+                    <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-1 pointer-events-none">
                       <span className="text-[8px] font-mono text-white truncate w-full">{item.filename}</span>
                     </div>
                   </>
@@ -782,10 +835,10 @@ function BuildDashboard({ sessionId, onDone }: { sessionId: string; onDone: () =
         </div>
         {/* 流式代码预览（美术完成后才显示） */}
         {artGenDone && !codeGenDone && (
-          <div className="bg-gray-950 rounded p-3 h-28 overflow-hidden border border-gray-800">
+          <div className="bg-gray-950 rounded p-3 max-h-40 overflow-y-auto border border-gray-800">
             {gameCodeStreaming ? (
               <pre className="font-mono text-[10px] text-green-400/80 leading-relaxed whitespace-pre-wrap break-all">
-                {gameCodeStreaming.slice(-600)}
+                {gameCodeStreaming.slice(-1200)}
                 <span className="animate-pulse text-green-400">▋</span>
               </pre>
             ) : (
@@ -997,10 +1050,15 @@ function ReviewDashboard({ sessionId, onDone }: { sessionId: string; onDone: () 
 // ──────────────────────────────────────────────────────────────────────────────
 // 游戏就绪面板（步骤 6）
 // ──────────────────────────────────────────────────────────────────────────────
-function GameReadyPanel({ sessionId, onOpenStudio }: { sessionId: string; onOpenStudio: () => void }) {
+function GameReadyPanel({ sessionId, onOpenStudio, onRegenerateCode }: {
+  sessionId: string
+  onOpenStudio: () => void
+  onRegenerateCode: () => void
+}) {
   const { gameCode, artGenItems, artAssets } = useGameStore()
   const artSuccess = artGenItems.filter((i) => !i.error).length
   const gameFileUrl = `/static/games/${sessionId}/index.html`
+  const [confirmRegen, setConfirmRegen] = useState(false)
 
   return (
     <div className="h-full flex flex-col items-center justify-center p-8 gap-6">
@@ -1048,23 +1106,50 @@ function GameReadyPanel({ sessionId, onOpenStudio }: { sessionId: string; onOpen
             🔗 独立窗口游玩
           </motion.a>
           {gameCode && (
-            <motion.button
+            <motion.a
               initial={{ y: 10, opacity: 0 }}
               animate={{ y: 0, opacity: 1 }}
               transition={{ delay: 0.4 }}
-              onClick={() => {
-                const blob = new Blob([gameCode], { type: 'text/html' })
-                const a = document.createElement('a')
-                a.href = URL.createObjectURL(blob)
-                a.download = `roguelike-${sessionId.slice(0, 8)}.html`
-                a.click()
-              }}
-              className="flex-1 py-3 font-mono text-sm border border-gray-700 text-gray-400 hover:bg-gray-800/30 rounded-xl transition-all"
+              href={`/api/sessions/${sessionId}/download-game`}
+              download
+              className="flex-1 py-3 font-mono text-sm text-center border border-gray-700 text-gray-400 hover:bg-gray-800/30 rounded-xl transition-all"
             >
-              ↓ 下载 HTML
-            </motion.button>
+              ↓ 下载游戏包
+            </motion.a>
           )}
         </div>
+
+        {/* 重新生成代码按钮 */}
+        {!confirmRegen ? (
+          <motion.button
+            initial={{ y: 10, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ delay: 0.5 }}
+            onClick={() => setConfirmRegen(true)}
+            className="w-full py-3 font-mono text-sm border border-orange-800/60 text-orange-400/80 hover:border-orange-600 hover:text-orange-300 hover:bg-orange-950/20 rounded-xl transition-all"
+          >
+            ↻ 重新生成 H5 代码（保留美术资源）
+          </motion.button>
+        ) : (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            className="flex gap-2"
+          >
+            <button
+              onClick={() => { setConfirmRegen(false); onRegenerateCode() }}
+              className="flex-1 py-3 font-mono text-sm font-bold bg-orange-900/40 border border-orange-600 text-orange-300 hover:bg-orange-800/50 rounded-xl transition-all"
+            >
+              确认重新生成
+            </button>
+            <button
+              onClick={() => setConfirmRegen(false)}
+              className="px-4 py-3 font-mono text-sm border border-gray-700 text-gray-500 hover:text-gray-300 rounded-xl transition-all"
+            >
+              取消
+            </button>
+          </motion.div>
+        )}
       </div>
 
       {/* 美术资源预览 */}
@@ -1073,7 +1158,7 @@ function GameReadyPanel({ sessionId, onOpenStudio }: { sessionId: string; onOpen
           <p className="font-mono text-xs text-gray-600 mb-2">已生成美术资源</p>
           <div className="grid grid-cols-5 gap-1.5">
             {Object.entries(artAssets).slice(0, 10).map(([name, url]) => (
-              <img key={name} src={url as string} alt={name} className="aspect-square rounded object-cover" />
+              <ClickableArtImage key={name} src={url as string} alt={name} className="aspect-square rounded object-cover" />
             ))}
           </div>
         </div>
@@ -1081,6 +1166,460 @@ function GameReadyPanel({ sessionId, onOpenStudio }: { sessionId: string; onOpen
     </div>
   )
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 历史产出查看面板（查看已完成步骤的中间产物，只读回放）
+// ──────────────────────────────────────────────────────────────────────────────
+function HistoryViewPanel({ viewStep }: { viewStep: number }) {
+  const {
+    sections, artSamples, artGenItems, artGenDone, codeGenDone, gameCode,
+    reviewIssues, reviewFixes, reviewSummary, reviewChangedLines, reviewDone,
+  } = useGameStore()
+
+  // ── 步骤 1/2：GDD 方案文档摘要 ─────────────────────────────────
+  if (viewStep <= 2) {
+    const SECTION_META = [
+      { key: 'final'     as const, icon: '📄', label: '完整文档',  color: 'text-cyan-400'   },
+      { key: 'gameplay'  as const, icon: '🎮', label: '玩法设计',  color: 'text-green-400'  },
+      { key: 'worldview' as const, icon: '🌍', label: '世界观',    color: 'text-blue-400'   },
+      { key: 'art'       as const, icon: '🎨', label: '美术方案',  color: 'text-purple-400' },
+      { key: 'tech'      as const, icon: '💻', label: '技术方案',  color: 'text-yellow-400' },
+    ]
+    const hasAnyDoc = SECTION_META.some(m => Boolean(sections[m.key]))
+    return (
+      <div className="h-full overflow-y-auto p-5 space-y-4">
+        <div className="font-mono text-xs text-gray-500 tracking-widest mb-2">
+          ▸ {viewStep === 1 ? '方案生成' : '确认方案'} · 历史产出预览
+        </div>
+        {hasAnyDoc ? (
+          <div className="space-y-3">
+            {SECTION_META.map(({ key, icon, label, color }) => {
+              const content = sections[key]
+              if (!content) return null
+              return (
+                <div key={key} className="rounded-lg border border-gray-700/50 p-3 bg-gray-900/40">
+                  <div className={`font-mono text-xs font-bold mb-2 ${color}`}>{icon} {label}</div>
+                  <div className="font-mono text-[11px] text-gray-400 leading-relaxed">
+                    {content.slice(0, 280)}{content.length > 280 ? '...' : ''}
+                  </div>
+                  <div className="mt-1.5 font-mono text-[10px] text-gray-700">
+                    共 {content.length.toLocaleString()} 字符 · 右侧面板可查看完整内容
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center h-48 gap-3 text-gray-700">
+            <div className="text-3xl opacity-20">📄</div>
+            <p className="font-mono text-xs">暂无文档内容</p>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // ── 步骤 3：已确认美术风格样图回放 ──────────────────────────────
+  if (viewStep === 3) {
+    const sampleKeys = Object.keys(artSamples)
+    return (
+      <div className="h-full overflow-y-auto p-5 space-y-4">
+        <div className="font-mono text-xs text-gray-500 tracking-widest mb-2">▸ 美术风格 · 已确认样图回放</div>
+        {sampleKeys.length > 0 ? (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 px-3 py-2 bg-green-950/20 border border-green-900/40 rounded-lg">
+              <span className="text-green-500 text-sm">✓</span>
+              <span className="font-mono text-xs text-green-400">美术风格已确认，共 {sampleKeys.length} 张样图</span>
+            </div>
+            {SAMPLE_SLOTS.map((slot) => {
+              const url = artSamples[slot.key]
+              return (
+                <div
+                  key={slot.key}
+                  className={`rounded-xl overflow-hidden border ${url ? 'border-green-700/40' : 'border-gray-800 border-dashed'}`}
+                  style={slot.key === 'char_protagonist_sample'
+                    ? { background: 'repeating-conic-gradient(#1c2b3a 0% 25%,#233040 0% 50%) 0 0/14px 14px' }
+                    : {}}
+                >
+                  {url
+                    ? <img src={url} alt={slot.key} className="w-full h-auto block" />
+                    : <div className="h-28 flex items-center justify-center text-gray-700 font-mono text-xs">未生成</div>
+                  }
+                  <div className="px-2.5 py-1.5 bg-gray-900/90 flex items-center justify-between">
+                    <span className="font-mono text-[11px] text-gray-400">{slot.label}</span>
+                    {url && <span className="font-mono text-[9px] text-green-600">已确认 ✓</span>}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center h-48 gap-3 text-gray-700">
+            <div className="text-3xl opacity-20">🎨</div>
+            <p className="font-mono text-xs">暂无美术样图记录</p>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // ── 步骤 4：游戏生成产出预览（美术资源 + 代码） ──────────────────
+  if (viewStep === 4) {
+    const artSuccess = artGenItems.filter(i => !i.error && i.url_path)
+    return (
+      <div className="h-full overflow-y-auto p-5 space-y-5">
+        <div className="font-mono text-xs text-gray-500 tracking-widest mb-2">▸ 游戏生成 · 产出预览</div>
+
+        {/* 美术资源完成卡片 */}
+        <div className={`rounded-xl border p-4 ${artGenDone ? 'border-purple-800/40 bg-purple-950/10' : 'border-gray-800 bg-gray-900/10'}`}>
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-lg">🎨</span>
+            <span className="font-mono text-sm font-bold text-purple-300">美术资源</span>
+            <span className={`ml-auto text-xs font-mono ${artGenDone ? 'text-green-500' : 'text-gray-600'}`}>
+              {artGenDone ? `✓ ${artSuccess.length} 张完成` : '未完成'}
+            </span>
+          </div>
+          {artSuccess.length > 0 && (
+            <div className="grid grid-cols-4 gap-1.5">
+              {artSuccess.map((item) => (
+                <div key={item.filename} className="aspect-square rounded overflow-hidden bg-gray-800/50 relative group">
+                  <ClickableArtImage src={item.url_path} alt={item.filename} className="w-full h-full object-cover" />
+                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-1 pointer-events-none">
+                    <span className="text-[8px] font-mono text-white truncate w-full">{item.filename}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          {artSuccess.length === 0 && (
+            <div className="text-xs font-mono text-gray-700">暂无美术资源记录</div>
+          )}
+        </div>
+
+        {/* H5 代码完成卡片 */}
+        <div className={`rounded-xl border p-4 ${codeGenDone ? 'border-green-800/50 bg-green-950/10' : 'border-gray-800 bg-gray-900/10 opacity-60'}`}>
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-lg">⚙</span>
+            <span className="font-mono text-sm font-bold text-cyan-300">H5 游戏代码</span>
+            <span className={`ml-auto text-xs font-mono ${codeGenDone ? 'text-green-500' : 'text-gray-600'}`}>
+              {codeGenDone ? '✓ 完成' : '未完成'}
+            </span>
+          </div>
+          {codeGenDone && (
+            <div className="text-xs font-mono text-green-600 mb-2">Phaser.js 3 · 单 HTML 文件 · 零依赖可运行</div>
+          )}
+          {gameCode && (
+            <div className="bg-gray-950 rounded p-2 max-h-60 overflow-y-auto border border-gray-800">
+              <pre className="font-mono text-[10px] text-green-400/70 leading-relaxed whitespace-pre-wrap break-all">
+                {gameCode.slice(0, 2000)}{gameCode.length > 2000 ? '\n...' : ''}
+              </pre>
+            </div>
+          )}
+          {!codeGenDone && <div className="text-xs font-mono text-gray-700">代码尚未生成</div>}
+        </div>
+      </div>
+    )
+  }
+
+  // ── 步骤 5：代码审查结果回放 ──────────────────────────────────
+  if (viewStep === 5) {
+    const p0p1Issues = reviewIssues.filter(i => i.priority === 'P0' || i.priority === 'P1')
+    const p2p3Issues = reviewIssues.filter(i => i.priority === 'P2' || i.priority === 'P3')
+    return (
+      <div className="h-full overflow-y-auto p-5 space-y-4">
+        <div className="font-mono text-xs text-gray-500 tracking-widest mb-2">▸ 代码检查 · 审查结果回放</div>
+
+        {/* 状态头 */}
+        <div className={`flex items-center gap-3 p-4 rounded-xl border ${
+          reviewDone ? 'border-green-800/50 bg-green-950/20' : 'border-gray-800 bg-gray-900/20'
+        }`}>
+          <span className="text-xl flex-shrink-0">{reviewIssues.length === 0 ? '✅' : '🔧'}</span>
+          <div>
+            <div className={`font-mono text-sm font-bold ${reviewDone ? 'text-green-400' : 'text-gray-500'}`}>
+              {reviewDone ? '检查已完成' : '检查未完成'}
+            </div>
+            {reviewDone && (
+              <div className="font-mono text-xs text-gray-500 mt-0.5">
+                {reviewIssues.length > 0
+                  ? `发现 ${reviewIssues.length} 个问题 · ${reviewFixes.length} 个修复 · ${reviewChangedLines} 行变更`
+                  : '代码质量良好，无需修改'}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* 总结 */}
+        {reviewSummary && (
+          <div className="px-4 py-3 rounded-lg border border-cyan-900/40 bg-cyan-950/20">
+            <span className="font-mono text-xs text-cyan-400">{reviewSummary}</span>
+          </div>
+        )}
+
+        {/* P0/P1 关键问题 */}
+        {p0p1Issues.length > 0 && (
+          <div className="space-y-2">
+            <div className="font-mono text-xs text-red-400 font-bold">⚠ 关键问题（已自动修复）</div>
+            {p0p1Issues.map((issue) => {
+              const fix = reviewFixes.find(f => f.issue_id === issue.id)
+              return (
+                <div key={issue.id} className="rounded-lg border border-red-900/40 bg-red-950/10 p-3 space-y-1">
+                  <div className="flex items-start gap-2">
+                    <span className={`font-mono text-[10px] px-1.5 py-0.5 rounded flex-shrink-0 mt-0.5 ${
+                      issue.priority === 'P0' ? 'bg-red-900 text-red-300' : 'bg-orange-900 text-orange-300'
+                    }`}>{issue.priority}</span>
+                    <span className="font-mono text-xs text-red-300">{issue.desc}</span>
+                  </div>
+                  {issue.location && (
+                    <div className="font-mono text-[10px] text-gray-600 pl-7">📍 {issue.location}</div>
+                  )}
+                  {fix && (
+                    <div className="font-mono text-[10px] text-green-500 pl-7">
+                      ✓ 修复：{fix.desc}{fix.lines_changed > 0 ? ` (${fix.lines_changed} 行)` : ''}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {/* P2/P3 优化建议 */}
+        {p2p3Issues.length > 0 && (
+          <div className="space-y-1">
+            <div className="font-mono text-xs text-yellow-600 font-bold">💡 优化建议</div>
+            {p2p3Issues.map((issue) => (
+              <div key={issue.id} className="flex items-start gap-2 px-3 py-2 rounded border border-yellow-900/30 bg-yellow-950/10">
+                <span className="font-mono text-[10px] px-1 py-0.5 rounded flex-shrink-0 mt-0.5 bg-yellow-900/60 text-yellow-400">{issue.priority}</span>
+                <span className="font-mono text-[11px] text-yellow-300/80">{issue.desc}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {reviewDone && reviewIssues.length === 0 && (
+          <div className="text-center py-8 text-green-500">
+            <div className="text-4xl mb-2">✅</div>
+            <div className="font-mono text-sm">代码结构完整，玩法逻辑无误</div>
+          </div>
+        )}
+
+        {!reviewDone && (
+          <div className="flex flex-col items-center justify-center h-32 gap-3 text-gray-700">
+            <div className="text-3xl opacity-20">🔍</div>
+            <p className="font-mono text-xs">暂无代码审查记录</p>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return null
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 游戏预览 + 实时修改面板（步骤 6+）
+// ──────────────────────────────────────────────────────────────────────────────
+function GamePreviewWithModifier({
+  sessionId,
+  iframeRef,
+}: {
+  sessionId: string
+  iframeRef: React.RefObject<HTMLIFrameElement | null>
+}) {
+  const {
+    modifyInProgress, setModifyInProgress,
+    modifyAnalysis, setModifyAnalysis,
+    modifyResults, addModifyResult,
+    modifyChangedFiles, setModifyChangedFiles,
+    addModifyHistory, resetModify, addMessage, setGameCode,
+  } = useGameStore()
+  const [instruction, setInstruction] = useState('')
+  const [showPanel, setShowPanel] = useState(false)
+  const modifyEsRef = useRef<EventSource | null>(null)
+
+  const handleModify = useCallback(() => {
+    const text = instruction.trim()
+    if (!text || !sessionId || modifyInProgress) return
+
+    resetModify()
+    setModifyInProgress(true)
+    addMessage({ role: 'user', content: `🔧 修改请求：${text}` })
+
+    const es = new EventSource(
+      `/api/sessions/${sessionId}/modify-code?instruction=${encodeURIComponent(text)}`
+    )
+    modifyEsRef.current = es
+
+    es.addEventListener('progress', (e) => {
+      const d = JSON.parse(e.data)
+      setModifyAnalysis(d.message ?? '')
+    })
+    es.addEventListener('analysis', (e) => {
+      const d = JSON.parse(e.data)
+      setModifyAnalysis(d.text ?? '')
+    })
+    es.addEventListener('patch_result', (e) => {
+      addModifyResult(JSON.parse(e.data))
+    })
+    es.addEventListener('done', (e) => {
+      const d = JSON.parse(e.data)
+      setModifyChangedFiles(d.changed_files ?? [])
+      setModifyInProgress(false)
+      const changedFiles = d.changed_files ?? []
+      const successCount = d.success_count ?? 0
+      const failCount = d.fail_count ?? 0
+
+      if (changedFiles.length > 0) {
+        addModifyHistory({ instruction: text, changedFiles })
+        addMessage({
+          role: 'system',
+          content: `✓ 代码已修改：${changedFiles.join(', ')}（${successCount} 个补丁成功${failCount > 0 ? `，${failCount} 个失败` : ''}）`,
+        })
+        if (iframeRef.current) {
+          iframeRef.current.src = `/static/games/${sessionId}/index.html?t=${Date.now()}`
+        }
+        fetch(`/api/sessions/${sessionId}/game`)
+          .then((r) => (r.ok ? r.text() : ''))
+          .then((html) => { if (html) setGameCode(html) })
+      } else {
+        addMessage({ role: 'system', content: '⚠ 修改未成功应用，请换个描述方式重试' })
+      }
+      es.close()
+      setInstruction('')
+    })
+    es.addEventListener('error', (e) => {
+      try {
+        const d = JSON.parse((e as MessageEvent).data ?? '{}')
+        addMessage({ role: 'system', content: `⚠ ${d.message || '修改失败'}` })
+      } catch { /* connection error */ }
+      setModifyInProgress(false)
+      es.close()
+    })
+    es.onerror = () => {
+      setModifyInProgress(false)
+      es.close()
+    }
+  }, [sessionId, instruction, modifyInProgress]) // eslint-disable-line
+
+  useEffect(() => () => { modifyEsRef.current?.close() }, [])
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* 顶部栏 */}
+      <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-800 text-xs font-mono flex-shrink-0">
+        <span className="text-green-400">● 游戏运行中</span>
+        <span className="text-gray-600 ml-auto">点击游戏区域激活键盘</span>
+        <button
+          onClick={() => setShowPanel(!showPanel)}
+          className={`ml-2 px-2 py-1 rounded border text-[10px] transition-all ${
+            showPanel
+              ? 'border-cyan-600 text-cyan-300 bg-cyan-950/30'
+              : 'border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-500'
+          }`}
+        >
+          {showPanel ? '✕ 收起修改' : '🔧 修改代码'}
+        </button>
+      </div>
+
+      {/* 游戏 iframe */}
+      <iframe
+        ref={iframeRef}
+        className={`w-full border-0 bg-black ${showPanel ? 'flex-[3]' : 'flex-1'}`}
+        title="Game Preview"
+        sandbox="allow-scripts allow-same-origin"
+      />
+
+      {/* 修改面板（展开时显示） */}
+      {showPanel && (
+        <div className="flex-[2] min-h-0 border-t border-gray-800 flex flex-col bg-gray-950">
+          {/* 修改进度/结果 */}
+          {(modifyInProgress || modifyAnalysis || modifyResults.length > 0) && (
+            <div className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0">
+              {/* 分析结果 */}
+              {modifyAnalysis && (
+                <div className="px-3 py-2 rounded-lg border border-cyan-900/40 bg-cyan-950/20">
+                  <span className="font-mono text-[11px] text-cyan-400">{modifyAnalysis}</span>
+                </div>
+              )}
+              {/* 补丁应用结果 */}
+              {modifyResults.map((r, i) => (
+                <div
+                  key={i}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded text-[10px] font-mono ${
+                    r.ok
+                      ? 'border border-green-900/40 bg-green-950/10 text-green-400'
+                      : 'border border-red-900/40 bg-red-950/10 text-red-400'
+                  }`}
+                >
+                  <span>{r.ok ? '✓' : '✗'}</span>
+                  <span className="font-bold">{r.file}</span>
+                  <span className="text-gray-500">—</span>
+                  <span>{r.reason}</span>
+                </div>
+              ))}
+              {/* 变更的文件 */}
+              {modifyChangedFiles.length > 0 && (
+                <div className="flex items-center gap-2 px-3 py-2 rounded-lg border border-green-800/40 bg-green-950/15">
+                  <span className="text-green-500 text-sm">✓</span>
+                  <span className="font-mono text-xs text-green-400">
+                    已修改：{modifyChangedFiles.join(', ')}
+                  </span>
+                </div>
+              )}
+              {modifyInProgress && (
+                <div className="flex items-center gap-2 px-3 py-2">
+                  <div className="w-3 h-3 rounded-full border-2 border-cyan-500 border-t-transparent animate-spin flex-shrink-0" />
+                  <span className="font-mono text-[10px] text-cyan-400 animate-pulse">AI 分析中...</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 修改历史（简要） */}
+          {useGameStore.getState().modifyHistory.length > 0 && !modifyInProgress && modifyResults.length === 0 && (
+            <div className="px-3 pt-2 space-y-1 overflow-y-auto max-h-20">
+              {useGameStore.getState().modifyHistory.slice(-3).map((h, i) => (
+                <div key={i} className="flex items-center gap-2 text-[10px] font-mono text-gray-600">
+                  <span className="text-green-700">✓</span>
+                  <span className="truncate">{h.instruction}</span>
+                  <span className="ml-auto text-gray-800 flex-shrink-0">{h.changedFiles.join(',')}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 输入框 */}
+          <div className="flex-shrink-0 border-t border-gray-800 p-3">
+            <div className="flex gap-2 items-end">
+              <textarea
+                value={instruction}
+                onChange={(e) => setInstruction(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleModify() }
+                }}
+                rows={2}
+                placeholder="描述你想修改的内容（如：把主角攻击改为近战、修复敌人不移动的bug、增加Boss血量...）"
+                disabled={modifyInProgress}
+                className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 font-mono text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-cyan-700 disabled:opacity-40 resize-none"
+              />
+              <button
+                onClick={handleModify}
+                disabled={modifyInProgress || !instruction.trim()}
+                className="px-4 py-2 h-full bg-cyan-900 hover:bg-cyan-800 border border-cyan-600 text-cyan-300 font-mono text-xs font-bold rounded-lg disabled:opacity-40 transition-all flex-shrink-0"
+              >
+                {modifyInProgress ? '⟳' : '✎'} 修改
+              </button>
+            </div>
+            <div className="mt-1.5 font-mono text-[9px] text-gray-700">
+              Enter 发送 · Shift+Enter 换行 · 补丁式修改，不会重写整个文件
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 右侧面板：GDD / 代码流 / 游戏预览
@@ -1117,9 +1656,10 @@ function DiffView({ hunks }: { hunks: DiffHunk[] }) {
 }
 
 function RightPanel({ step, sessionId }: { step: number; sessionId: string }) {
-  const { sections, gameCode, gameCodeStreaming, codeGenDone,
+  const { sections, gameCode, gameCodeStreaming, codeGenDone, codeGenProgress,
           artGenDone, artGenItems, artGenTotal,
-          reviewDiff, reviewDone, reviewChangedLines } = useGameStore()
+          reviewDiff, reviewDone, reviewChangedLines,
+          artSamples } = useGameStore()
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const codeEndRef = useRef<HTMLDivElement>(null)
   const [activeDocTab, setActiveDocTab] = useState<DocTab>('final')
@@ -1129,31 +1669,67 @@ function RightPanel({ step, sessionId }: { step: number; sessionId: string }) {
     codeEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [gameCodeStreaming])
 
-  // 将 gameCode 写入 iframe（step >= 5）
+  // 将游戏加载到 iframe（step >= 5）：优先使用多文件静态路径，降级为 doc.write
   useEffect(() => {
-    if (step < 5 || !gameCode || !iframeRef.current) return
-    const doc = iframeRef.current.contentDocument
-    if (!doc) return
-    doc.open()
-    doc.write(gameCode)
-    doc.close()
-  }, [step, gameCode])
+    if (step < 5 || !iframeRef.current) return
+    if (sessionId) {
+      iframeRef.current.src = `/static/games/${sessionId}/index.html?t=${Date.now()}`
+    } else if (gameCode) {
+      const doc = iframeRef.current.contentDocument
+      if (!doc) return
+      doc.open()
+      doc.write(gameCode)
+      doc.close()
+    }
+  }, [step, gameCode, sessionId])
 
-  // ── Step 6+：游戏 iframe ─────────────────────────────────────
+  // ── Step 3：美术风格样图预览 ─────────────────────────────────
+  if (step === 3) {
+    const sampleCount = Object.keys(artSamples).length
+    return (
+      <div className="h-full flex flex-col bg-gray-950">
+        <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-800 flex-shrink-0">
+          <span className="text-lg">🎨</span>
+          <span className="text-xs font-mono text-purple-400">
+            {sampleCount > 0 ? `美术风格样图（${sampleCount}/3）` : '等待样图生成...'}
+          </span>
+        </div>
+        <div className="flex-1 overflow-auto p-4 space-y-3">
+          {sampleCount > 0 ? (
+            SAMPLE_SLOTS.map((slot) => {
+              const url = artSamples[slot.key]
+              if (!url) return null
+              return (
+                <div
+                  key={slot.key}
+                  className="rounded-xl overflow-hidden border border-purple-700/40"
+                  style={slot.key === 'char_protagonist_sample'
+                    ? { background: 'repeating-conic-gradient(#1c2b3a 0% 25%,#233040 0% 50%) 0 0/14px 14px' }
+                    : {}}
+                >
+                  <img src={url} alt={slot.key} className="w-full h-auto block" />
+                  <div className="px-2.5 py-1.5 bg-gray-900/90 flex items-center justify-between">
+                    <span className="font-mono text-[11px] text-gray-400">{slot.label}</span>
+                    <span className="font-mono text-[9px] text-gray-600">{slot.hint}</span>
+                  </div>
+                </div>
+              )
+            })
+          ) : (
+            <div className="h-full flex flex-col items-center justify-center gap-3 text-gray-700">
+              <div className="w-6 h-6 rounded-full border-2 border-purple-700 border-t-transparent animate-spin" />
+              <p className="font-mono text-xs">等待美术样图生成...</p>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // ── Step 6+：游戏 iframe + 实时修改面板 ──────────────────────
   if (step >= 6 && gameCode) {
     return (
-      <div className="h-full flex flex-col">
-        <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-800 text-xs font-mono">
-          <span className="text-green-400">● 游戏运行中</span>
-          <span className="text-gray-600 ml-auto">点击游戏区域激活键盘</span>
-        </div>
-        <iframe
-          ref={iframeRef}
-          className="flex-1 w-full border-0 bg-black"
-          title="Game Preview"
-          sandbox="allow-scripts allow-same-origin"
-        />
-      </div>
+      <GamePreviewWithModifier sessionId={sessionId} iframeRef={iframeRef} />
     )
   }
 
@@ -1269,11 +1845,26 @@ function RightPanel({ step, sessionId }: { step: number; sessionId: string }) {
               {gameCodeStreaming}
               {!codeGenDone && <span className="inline-block w-2 h-3 bg-green-400 animate-pulse ml-0.5 align-middle" />}
             </pre>
+          ) : codeGenDone ? (
+            <div className="h-full flex flex-col items-center justify-center gap-3 text-green-500">
+              <div className="text-5xl">✅</div>
+              <p className="font-mono text-sm font-bold">代码生成完毕</p>
+              <p className="font-mono text-[10px] text-gray-600">正在进入代码检查...</p>
+            </div>
           ) : (
-            <div className="h-full flex flex-col items-center justify-center gap-3 text-gray-700">
-              <div className="w-6 h-6 rounded-full border-2 border-cyan-700 border-t-transparent animate-spin" />
-              <p className="font-mono text-xs">等待 LLM 开始输出代码...</p>
-              <p className="font-mono text-[10px] text-gray-800">Phaser.js 3 · H5 游戏原型生成中</p>
+            <div className="h-full flex flex-col items-center justify-center gap-4 text-gray-600 px-8">
+              <div className="w-8 h-8 rounded-full border-2 border-cyan-700 border-t-transparent animate-spin" />
+              <div className="text-center space-y-2">
+                <p className="font-mono text-xs text-cyan-400/80">
+                  {codeGenProgress || '正在调用 LLM 生成 Phaser.js 代码...'}
+                </p>
+                <p className="font-mono text-[10px] text-gray-700">
+                  大型 Prompt（GDD + 美术清单）传输中，首个 token 通常需要 20～60 秒
+                </p>
+                <p className="font-mono text-[10px] text-gray-800">
+                  请耐心等待，代码出现后会实时滚动显示
+                </p>
+              </div>
             </div>
           )}
           <div ref={codeEndRef} />
@@ -1515,6 +2106,21 @@ export function Workspace() {
     addMessage({ role: 'system', content: '🎨 风格已锁定，正在生成全套美术资源和游戏代码...' })
   }, [setPipelineStep, addMessage])
 
+  // ── 重新生成代码（保留美术资源）─────────────────────────────
+  const regenerateCode = useCallback(() => {
+    if (!sessionId) return
+    const store = useGameStore.getState()
+    store.setCodeGenDone(false)
+    store.setCodeGenProgress('')
+    store.clearGameCodeStreaming()
+    store.setReviewInProgress(false)
+    store.setReviewDone(false)
+    _artGenStarted.delete(sessionId)
+    _reviewStarted.delete(sessionId)
+    addMessage({ role: 'system', content: '↻ 正在重新生成 H5 代码（保留美术资源）...' })
+    setPipelineStep(4)
+  }, [sessionId, addMessage, setPipelineStep])
+
   // ── 自动启动（从 URL 参数） ──────────────────────────────────
   useEffect(() => {
     const sid = sessionParam || reqParam
@@ -1590,8 +2196,11 @@ export function Workspace() {
         setArtSamples(artSamples)
       }
 
-      // 3. 美术全套资源：恢复 artGenItems + artGenDone + artGenTotal
-      const artAssets = (data.art_assets as Record<string, string>) || {}
+      // 3. 美术全套资源：恢复 artGenItems + artGenTotal（artGenDone 由 art_full_done 决定）
+      const artAssets   = (data.art_assets as Record<string, string>) || {}
+      // art_full_done=true  → 美术 generate_art complete 事件已触发，真正完成，无需续传
+      // art_full_done=false → 中途中断，磁盘有部分文件，BuildDashboard 需续传剩余任务
+      const artFullDone = Boolean(data.art_full_done)
       if (Object.keys(artAssets).length > 0) {
         setArtAssets(artAssets)
         const total = Object.keys(artAssets).length
@@ -1599,7 +2208,10 @@ export function Workspace() {
         Object.entries(artAssets).forEach(([filename, url_path]) => {
           addArtGenItem({ filename, url_path, category: 'restored' })
         })
-        setArtGenDone(true)
+        // 只有真正完成才标记 artGenDone=true，否则 BuildDashboard 会自动续传
+        if (artFullDone) {
+          setArtGenDone(true)
+        }
       }
 
       // 4. 游戏代码
@@ -1624,9 +2236,9 @@ export function Workspace() {
         _reviewStarted.add(sid)
         useGameStore.getState().setReviewDone(true)
       } else if (backendStep >= 4) {
-        // step 4/5 时，art 已完成，BuildDashboard 不应重新触发
-        // 通过 _artGenStarted 标记阻止，codeGenDone 根据实际情况决定
-        if (Object.keys(artAssets).length > 0) {
+        // art_full_done=true → 美术真正完成，阻止 BuildDashboard 重新触发美术生成
+        // art_full_done=false → 磁盘有部分文件，不加入 _artGenStarted，让 BuildDashboard 续传
+        if (artFullDone) {
           _artGenStarted.add(sid)
         }
       }
@@ -1717,38 +2329,54 @@ export function Workspace() {
           />
         </aside>
 
-        {/* 中栏：交互内容（查看模式时不切换中栏，保持当前流程） */}
+        {/* 中栏：交互内容（查看模式时显示历史产出，正常模式显示当前流程） */}
         <main className="flex-1 border-r border-gray-800/50 bg-gray-950/60 flex flex-col min-w-0 overflow-hidden">
           <AnimatePresence mode="wait">
-            {pipelineStep <= 2 && (
-              <motion.div key="chat" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
-                <ChatPanel
-                  onConfirm={confirmAndBuild}
-                  onFeedback={sendFeedback}
-                  isRevising={isRevising}
-                  changedSections={changedSections}
-                />
+            {/* 查看历史模式：用 HistoryViewPanel 覆盖中栏 */}
+            {viewStep !== null ? (
+              <motion.div
+                key={`history-${viewStep}`}
+                initial={{ opacity: 0, x: -8 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 8 }}
+                transition={{ duration: 0.18 }}
+                className="h-full"
+              >
+                <HistoryViewPanel viewStep={viewStep} />
               </motion.div>
-            )}
-            {pipelineStep === 3 && (
-              <motion.div key="art-style" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
-                <ArtStylePanel sessionId={sessionId} onApprove={startFullBuild} />
-              </motion.div>
-            )}
-            {pipelineStep === 4 && (
-              <motion.div key="build" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
-                <BuildDashboard sessionId={sessionId} onDone={() => setPipelineStep(5)} />
-              </motion.div>
-            )}
-            {pipelineStep === 5 && (
-              <motion.div key="review" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
-                <ReviewDashboard sessionId={sessionId} onDone={() => setPipelineStep(6)} />
-              </motion.div>
-            )}
-            {pipelineStep >= 6 && (
-              <motion.div key="ready" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
-                <GameReadyPanel sessionId={sessionId} onOpenStudio={openStudio} />
-              </motion.div>
+            ) : (
+              <>
+                {pipelineStep <= 2 && (
+                  <motion.div key="chat" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
+                    <ChatPanel
+                      onConfirm={confirmAndBuild}
+                      onFeedback={sendFeedback}
+                      isRevising={isRevising}
+                      changedSections={changedSections}
+                    />
+                  </motion.div>
+                )}
+                {pipelineStep === 3 && (
+                  <motion.div key="art-style" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
+                    <ArtStylePanel sessionId={sessionId} onApprove={startFullBuild} />
+                  </motion.div>
+                )}
+                {pipelineStep === 4 && (
+                  <motion.div key="build" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
+                    <BuildDashboard sessionId={sessionId} onDone={() => setPipelineStep(5)} />
+                  </motion.div>
+                )}
+                {pipelineStep === 5 && (
+                  <motion.div key="review" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
+                    <ReviewDashboard sessionId={sessionId} onDone={() => setPipelineStep(6)} />
+                  </motion.div>
+                )}
+                {pipelineStep >= 6 && (
+                  <motion.div key="ready" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
+                    <GameReadyPanel sessionId={sessionId} onOpenStudio={openStudio} onRegenerateCode={regenerateCode} />
+                  </motion.div>
+                )}
+              </>
             )}
           </AnimatePresence>
         </main>
